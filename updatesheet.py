@@ -1,726 +1,1004 @@
-import gspread
-from google.oauth2.service_account import Credentials
-import requests
-import time
-import yfinance as yf
-import pandas as pd
-import numpy as np
-from functools import wraps
-from datetime import datetime, timedelta
+"""
+Stock update application for maintaining a Google Sheets dashboard with stock metrics.
+This script fetches financial data, calculates technical indicators, and updates a Google Sheet.
+
+Improvements:
+- Modular architecture with separate components
+- Asynchronous API calls for improved performance
+- Rate limit handling with automatic fallback between providers
+- Error handling with detailed logging
+- Configurable metrics and calculations
+- Caching mechanism for frequently accessed data
+- Visualization of top stock pick
+"""
+import asyncio
 import logging
+import sys
+import time
+from datetime import datetime
+from typing import List, Dict, Any, Tuple, Optional
+from functools import lru_cache
+from io import BytesIO
 
-# --- Config ---
-SPREADSHEET_ID       = "1bWANjyQeU6srKRZO0fWNFTItd_gR3kbdjsycToaJXKo"
-MAIN_SHEET           = "Sheet1"
-TEMP_SHEET           = "_Temp"
-SERVICE_ACCOUNT_FILE = r"C:\Users\zerou\OneDrive\Documents\StockSpikeReplicator\credentials.json"
+from config import (
+    API_KEYS, RATE_LIMITS, SPREADSHEET_ID, MAIN_SHEET, TEMP_SHEET,
+    SERVICE_ACCOUNT_FILE, HEADER, SIMPLE_SCORE_WEIGHTS, ADVANCED_SCORE_WEIGHTS,
+    CELL_FORMATS, LOG_FORMAT, LOG_LEVEL, LOG_FILE, API_ENDPOINTS,
+    idx_to_col, COLUMNS
+)
+from technical_indicators import (
+    calculate_sharpe_ratio, detect_volatility_squeeze,
+    calculate_max_drawdown, calculate_moving_average_ratio, calculate_momentum,
+    calculate_macd, calculate_bollinger_bands, calculate_rsi
+)
+from scoring import ScoreCalculator
+from data_fetchers import DataFetcher
+from sheets_handler import SheetsHandler
+from ml_backtesting import run_ml_backtesting
+from visualizations import plot_top_stock_pick
 
-API_KEYS = {
-    'finnhub':       'YOUR_FINNHUB_KEY',
-    'alpha_vantage': 'YOUR_ALPHA_VANTAGE_KEY',
-    'openai':        'YOUR_OPENAI_KEY',
-    'gemini':        'YOUR_GEMINI_KEY'
-}
-LIMITS = {'finnhub':30,'alpha_vantage':5,'openai':60,'gemini':60}
-
-# Set up logging
+# Configure logging
 logging.basicConfig(
-    filename='stock_update.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    filename=LOG_FILE,
+    level=getattr(logging, LOG_LEVEL),
+    format=LOG_FORMAT
 )
 
-# Rate-limit state
-api_calls    = {k: [] for k in LIMITS}
-api_failures = {k: {'cnt':0,'until':None,'dead':False} for k in LIMITS}
+# Create console handler for output
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setFormatter(logging.Formatter(LOG_FORMAT))
+logging.getLogger().addHandler(console_handler)
 
-# Main‐sheet cols
-C_PRICE   = "L"
-C_TODAY   = "O"
-C_SUPPORT = "H"
-C_RESIST  = "I"
-C_SCORE   = "U"
-C_EXP     = "Z"
-C_OPENAI  = "P"
-C_GEMINI  = "Q"
-C_RSI     = "R"   # New column for RSI
-C_SHARPE  = "S"   # New column for Sharpe ratio
-C_SQUEEZE = "T"   # New column for Squeeze indicator
-C_DRAWDOWN= "V"   # New column for Drawdown%
-C_BETA    = "W"   # New column for Beta
-C_MA_RATIO= "X"   # New column for MA50/200
-C_MOMENTUM= "Y"   # New column for Momentum%
-C_PE      = "AA"  # New column for P/E
-C_DE      = "AB"  # New column for D/E
+logger = logging.getLogger('main')
 
-# Temp header row
-HEADER = [
-    'Symbol','Support (20d)','Resistance (20d)','RSI','Sharpe',
-    'Squeeze?','Drawdown%','Beta','MA50/200','Momentum%',
-    'P/E','D/E','Score','Verdict','OpenAI','Gemini'
-]
 
-# --- Utility Functions ---
-def validate_numeric(value, default=0):
-    """Ensure a value is numeric and not None/empty"""
-    if value is None:
-        return default
-    try:
-        val = float(value)
-        return val if not np.isnan(val) else default
-    except:
-        return default
+class StockUpdateApp:
+    """Main application class for updating the stock data sheet."""
+    
+    def __init__(self):
+        """Initialize the application components."""
+        self.data_fetcher = DataFetcher(API_KEYS, RATE_LIMITS)
+        self.sheets_handler = SheetsHandler(SPREADSHEET_ID, SERVICE_ACCOUNT_FILE, batch_size=20)
+        self.score_calculator = ScoreCalculator({
+            'simple': SIMPLE_SCORE_WEIGHTS,
+            'advanced': ADVANCED_SCORE_WEIGHTS
+        })
+        self.sector_cache = {}
+        self.symbol_data_cache = {}
+        self.historical_data = {}
+
+    @lru_cache(maxsize=1000)
+    def get_cached_sector_data(self, symbol: str) -> Tuple[str, Dict]:
+        """Get cached sector data for a symbol."""
+        sector = self.sector_cache.get(symbol, {}).get('sector', 'Unknown')
+        sector_metrics = self.sector_cache.get(symbol, {}).get('metrics', {})
+        return sector, sector_metrics
+
+    @lru_cache(maxsize=1000)
+    def get_cached_symbol_data(self, symbol: str, date_str: str) -> Dict:
+        """Get cached symbol data."""
+        return self.symbol_data_cache.get((symbol, date_str), {})
+
+    def cache_sector_data(self, sectors: Dict, sector_metrics: Dict):
+        """Cache sector data for all symbols."""
+        for symbol, sector in sectors.items():
+            self.sector_cache[symbol] = {
+                'sector': sector,
+                'metrics': sector_metrics.get(sector, {})
+            }
+
+    def cache_symbol_data(self, symbol: str, date_str: str, data: Dict):
+        """Cache symbol data."""
+        self.symbol_data_cache[(symbol, date_str)] = data
         
-def validate_string(value, default='N/A'):
-    """Ensure a value is a valid string"""
-    if value is None or value == '':
-        return default
-    return str(value)
-
-def check_rate(api):
-    now = time.time()
-    api_calls[api] = [t for t in api_calls[api] if now-t < 60]
-    info = api_failures[api]
-    if info['dead'] or (info['until'] and datetime.now()<info['until']):
-        return False
-    if len(api_calls[api]) < LIMITS[api]:
-        api_calls[api].append(now)
-        return True
-    return False
-
-def record_fail(api, code):
-    info = api_failures[api]
-    if code == 429:
-        info['cnt'] += 1
-        if api in ['openai','gemini'] and info['cnt'] > 2:
-            info['dead'] = True
-        elif info['cnt'] == 3:
-            info['until'] = datetime.now() + timedelta(minutes=1)
-
-def retry(api):
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(sym):
-            if not check_rate(api):
-                return 'RateLimit'
-            try:
-                return fn(sym)
-            except requests.HTTPError as e:
-                record_fail(api, e.response.status_code)
-                logging.error(f"HTTP Error in {fn.__name__} for {sym}: {e.response.status_code}")
-                return 'N/A' if e.response.status_code == 404 else 'Error'
-            except Exception as e:
-                record_fail(api, 429)
-                logging.error(f"Exception in {fn.__name__} for {sym}: {str(e)}")
-                return 'Error'
-        return wrapper
-    return decorator
-
-# --- Indicators ---
-def calculate_rsi(p):
-    try:
-        if len(p) < 15:
-            return 50  # Default to neutral if not enough data
+    async def run(self):
+        """Run the main update process."""
+        start_time = datetime.now()
+        logger.info(f"Starting stock update at {start_time:%H:%M:%S}")
+        print(f"🚀 Starting stock update at {start_time:%H:%M:%S}")
+        
+        try:
+            # Initialize sheets
+            main_sheet, temp_sheet = self.initialize_sheets()
             
-        deltas = np.diff(p)
-        ups = deltas.clip(min=0)
-        downs = -deltas.clip(max=0)
-        avg_up = ups[-14:].mean()
-        avg_down = downs[-14:].mean() or 1e-5
-        rs = avg_up/avg_down
-        return 100 - (100/(1+rs))
-    except Exception as e:
-        logging.error(f"RSI calculation error: {str(e)}")
-        return 50
-
-def calculate_sharpe(r):
-    try:
-        rf = (1+0.01)**(1/252) - 1
-        m, s = r.mean(), r.std()
-        return 0 if s==0 else ((m-rf)/s)*np.sqrt(252)
-    except Exception as e:
-        logging.error(f"Sharpe calculation error: {str(e)}")
-        return 0
-
-def detect_squeeze(p):
-    try:
-        s = pd.Series(p)
-        if len(s) < 21: 
+            # Get all rows from the main sheet
+            all_rows = self.sheets_handler.get_all_values(main_sheet)
+            if not all_rows or len(all_rows) <= 1:  # Account for header row
+                logger.error("No data found in the main sheet")
+                print("❌ No data found in the main sheet")
+                return False
+            
+            # Extract symbols and dates (skip header row)
+            symbol_data = []
+            for i, row in enumerate(all_rows[1:], 1):
+                if not row or not row[0].strip():
+                    continue
+                
+                symbol = row[0].strip()
+                date_str = row[2].strip() if len(row) > 2 else ""
+                symbol_data.append({
+                    'row': i+1,  # Add 1 to account for header row & 1-based indexing
+                    'symbol': symbol,
+                    'date': date_str
+                })
+            
+            total_symbols = len(symbol_data)
+            logger.info(f"Found {total_symbols} symbols to update")
+            print(f"Found {total_symbols} symbols to update")
+            
+            # Fetch sector data to provide context for scoring
+            if total_symbols > 5:
+                print("🔍 Fetching sector data...")
+                sectors = await self.get_sector_data([d['symbol'] for d in symbol_data])
+            else:
+                sectors = ({}, {})
+            
+            # Clear old data and prepare sheets
+            await self.prepare_sheets(main_sheet, temp_sheet, total_symbols)
+            
+            # Process symbols in batches to avoid overloading APIs
+            batch_size = 5
+            results_temp = []
+            results_main = []
+            
+            # Process all symbols in batches
+            for i in range(0, total_symbols, batch_size):
+                batch = symbol_data[i:i + batch_size]
+                
+                # Process the batch of symbols
+                batch_results = await self.process_symbols_batch(batch, sectors)
+                
+                # Add batch results to our aggregated results
+                for temp_buf, main_buf in batch_results:
+                    results_temp.extend(temp_buf)
+                    results_main.extend(main_buf)
+                
+                # Update the sheets with the batch results
+                if results_temp:
+                    self.sheets_handler.batch_update(temp_sheet, results_temp)
+                    print(f"✅ Updated temp sheet for batch {i//batch_size + 1}/{(total_symbols-1)//batch_size + 1}")
+                    results_temp = []
+                
+                if results_main:
+                    self.sheets_handler.batch_update(main_sheet, results_main)
+                    print(f"✅ Updated main sheet for batch {i//batch_size + 1}/{(total_symbols-1)//batch_size + 1}")
+                    results_main = []
+                
+                if i + batch_size < total_symbols:
+                    print("Cooldown period between batches. Please wait...")
+                    time.sleep(60)  # 60-second cooldown
+            
+            # Apply cell formatting
+            self.apply_formatting(main_sheet, total_symbols+1)  # +1 for header row
+            
+            # Run ML and backtesting
+            self.run_ml_backtesting()
+            
+            end_time = datetime.now()
+            duration = (end_time - start_time).total_seconds()
+            logger.info(f"Finished update at {end_time:%H:%M:%S} (duration: {duration:.2f} seconds)")
+            print(f"🎉 Finished update at {end_time:%H:%M:%S} (duration: {duration:.2f} seconds)")
+            
+            # Log cache statistics
+            logger.info(f"Sector cache hits: {self.get_cached_sector_data.cache_info().hits}")
+            logger.info(f"Symbol data cache hits: {self.get_cached_symbol_data.cache_info().hits}")
+            
+            return True
+            
+        except Exception as e:
+            logger.critical(f"Critical error in update process: {str(e)}", exc_info=True)
+            print(f"❌ Critical error: {str(e)}")
             return False
-        bw = s.rolling(20).std() * 4
-        return bw.iloc[-1] < bw.mean()*0.6
-    except Exception as e:
-        logging.error(f"Squeeze detection error: {str(e)}")
-        return False
 
-def max_drawdown(p):
-    try:
-        if not p or len(p) < 2:
-            return 0
-        peak, md = p[0], 0
-        for x in p:
-            peak = max(peak, x)
-            md = max(md, (peak-x)/peak) if peak > 0 else 0
-        return md*100
-    except Exception as e:
-        logging.error(f"Max drawdown calculation error: {str(e)}")
-        return 0
+    def clear_caches(self):
+        """Clear all caches."""
+        self.get_cached_sector_data.cache_clear()
+        self.get_cached_symbol_data.cache_clear()
+        self.sector_cache.clear()
+        self.symbol_data_cache.clear()
+        logger.info("All caches cleared")
 
-def calc_moving_avg_ratio(p):
-    try:
-        s = pd.Series(p)
-        if len(s) < 200: 
-            # Return 1.0 as neutral if not enough data
-            if len(s) >= 50:
-                # Can at least calculate MA50
-                return s.rolling(50).mean().iloc[-1] / s.iloc[-1]
-            return 1.0
-        ma50 = s.rolling(50).mean().iloc[-1]
-        ma200 = s.rolling(200).mean().iloc[-1]
-        if ma200 == 0:
-            return 1.0
-        return ma50 / ma200
-    except Exception as e:
-        logging.error(f"Moving average ratio calculation error: {str(e)}")
-        return 1.0
-
-def momentum(p):
-    try:
-        if len(p) > 20:
-            if p[-20] == 0:
-                return 0
-            return (p[-1]/p[-20] - 1)*100
-        return 0
-    except Exception as e:
-        logging.error(f"Momentum calculation error: {str(e)}")
-        return 0
-
-# --- Enhanced Technical Indicators ---
-def calculate_macd(prices):
-    try:
-        if len(prices) < 26:
-            return 0, 0
+    def run_ml_backtesting(self):
+        """Run machine learning and backtesting on historical data."""
+        try:
+            print("🧠 Running machine learning and backtesting...")
+            cumulative_returns = run_ml_backtesting(self.historical_data)
             
-        df = pd.DataFrame({'close': prices})
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        macd = exp1 - exp2
-        signal = macd.ewm(span=9, adjust=False).mean()
-        return macd.iloc[-1], signal.iloc[-1]
-    except Exception as e:
-        logging.error(f"MACD calculation error: {str(e)}")
-        return 0, 0
-
-def calculate_bollinger_bands(prices, window=20):
-    try:
-        if len(prices) < window:
-            return prices[-1] if len(prices) > 0 else 0, 0, 0
+            # Create a new sheet for ML and backtesting results
+            ml_sheet = self.sheets_handler.get_or_create_worksheet("ML_Backtesting")
+            ml_sheet.clear()
             
-        series = pd.Series(prices)
-        rolling_mean = series.rolling(window=window).mean()
-        rolling_std = series.rolling(window=window).std()
-        upper_band = rolling_mean + (rolling_std * 2)
-        lower_band = rolling_mean - (rolling_std * 2)
+            # Prepare data for the sheet
+            data = [["Date", "Cumulative Returns"]]
+            for date, returns in cumulative_returns.items():
+                data.append([date, returns])
+            
+            # Update the sheet
+            self.sheets_handler.batch_update(ml_sheet, [{'range': 'A1', 'values': data}])
+            
+            print("✅ Machine learning and backtesting completed")
+        except Exception as e:
+            logger.error(f"Error in ML and backtesting: {str(e)}")
+            print("❌ Error occurred during machine learning and backtesting")
+    
+    def initialize_sheets(self) -> Tuple[Any, Any]:
+        """Initialize Google Sheets connection and get required worksheets."""
+        if not self.sheets_handler.initialize():
+            raise RuntimeError("Failed to initialize Google Sheets connection")
         
-        if rolling_mean.iloc[-1] > 0:
-            return rolling_mean.iloc[-1], upper_band.iloc[-1], lower_band.iloc[-1]
-        return 0, 0, 0
-    except Exception as e:
-        logging.error(f"Bollinger bands calculation error: {str(e)}")
-        return 0, 0, 0
-
-# --- Data fetchers ---
-@retry('finnhub')
-def fetch_profile(sym):
-    r = requests.get(
-        "https://finnhub.io/api/v1/stock/profile2",
-        params={'symbol':sym,'token':API_KEYS['finnhub']}
-    )
-    r.raise_for_status()
-    return r.json() or {}
-
-@retry('alpha_vantage')
-def fetch_overview(sym):
-    r = requests.get(
-        "https://www.alphavantage.co/query",
-        params={'function':'OVERVIEW','symbol':sym,'apikey':API_KEYS['alpha_vantage']}
-    )
-    r.raise_for_status()
-    return r.json() or {}
-
-@retry('alpha_vantage')
-def fetch_pe(sym):
-    data = fetch_overview(sym)
-    pe = data.get('PERatio', '0')
-    if pe == 'None' or not pe:
-        return 0
-    try:
-        return float(pe)
-    except:
-        return 0
-
-@retry('alpha_vantage')
-def fetch_de(sym):
-    data = fetch_overview(sym)
-    de = data.get('DebtToEquity', '0')
-    if de == 'None' or not de:
-        return 0
-    try:
-        return float(de)
-    except:
-        return 0
-
-@retry('openai')
-def fetch_openai(sym):
-    payload = {
-        'model':'gpt-3.5-turbo',
-        'messages':[{'role':'user','content':f"Buy or Sell {sym}? Reply 'Buy' or 'Sell'."}]
-    }
-    h = {'Authorization':f"Bearer {API_KEYS['openai']}"}
-    r = requests.post("https://api.openai.com/v1/chat/completions", json=payload, headers=h)
-    r.raise_for_status()
-    content = r.json()['choices'][0]['message']['content'].strip()
-    # Normalize the response
-    if 'buy' in content.lower():
-        return 'Buy'
-    elif 'sell' in content.lower():
-        return 'Sell'
-    else:
-        return 'Hold'  # Default if response isn't clear
-
-@retry('gemini')
-def fetch_gemini(sym):
-    body = {
-        'model':'chat-bison-001',
-        'prompt':{'messages':[{'author':'user','content':f"Buy or Sell {sym}? Reply 'Buy' or 'Sell'."}]}
-    }
-    h = {'Authorization':f"Bearer {API_KEYS['gemini']}"}
-    r = requests.post('https://gemini.googleapis.com/v1/models/chat-bison-001:generateMessage', json=body, headers=h)
-    r.raise_for_status()
-    content = r.json()['candidates'][0]['content'].strip()
-    # Normalize the response
-    if 'buy' in content.lower():
-        return 'Buy'
-    elif 'sell' in content.lower():
-        return 'Sell'
-    else:
-        return 'Hold'  # Default if response isn't clear
-
-# --- Sheets helpers ---
-def init_sheets():
-    try:
-        creds = Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE,
-            scopes=['https://www.googleapis.com/auth/spreadsheets','https://www.googleapis.com/auth/drive']
-        )
-        client = gspread.authorize(creds)
-        ss = client.open_by_key(SPREADSHEET_ID)
-        return ss.worksheet(MAIN_SHEET), ss.worksheet(TEMP_SHEET)
-    except Exception as e:
-        logging.error(f"Failed to initialize sheets: {str(e)}")
-        raise
-
-def retry_on_429(fn):
-    @wraps(fn)
-    def wrapper(*a, **k):
-        for i in range(3):
+        try:
+            main_sheet = self.sheets_handler.get_or_create_worksheet(MAIN_SHEET)
+            temp_sheet = self.sheets_handler.get_or_create_worksheet(TEMP_SHEET)
+            return main_sheet, temp_sheet
+        except Exception as e:
+            logger.error(f"Failed to get worksheets: {str(e)}")
+            raise
+    
+    async def prepare_sheets(self, main_sheet, temp_sheet, total_rows):
+        """Prepare the sheets by clearing old data and setting up headers."""
+        try:
+            # Map column names to letters using idx_to_col and COLUMNS
+            col_price_now = idx_to_col(COLUMNS['price_now'])
+            col_today = idx_to_col(COLUMNS['today'])
+            col_support = idx_to_col(COLUMNS['support'])
+            col_resist = idx_to_col(COLUMNS['resistance'])
+            col_composite_score = idx_to_col(COLUMNS['composite_score'])
+            col_verdict = idx_to_col(COLUMNS['verdict'])
+            col_rsi = idx_to_col(COLUMNS['rsi'])
+            col_sharpe = idx_to_col(COLUMNS['sharpe'])
+            col_squeeze = idx_to_col(COLUMNS['squeeze'])
+            col_drawdown = idx_to_col(COLUMNS['drawdown'])
+            col_beta = idx_to_col(COLUMNS['beta'])
+            col_ma_ratio = idx_to_col(COLUMNS['ma_ratio'])
+            col_momentum = idx_to_col(COLUMNS['momentum'])
+            col_pe = idx_to_col(COLUMNS['pe'])
+            col_de = idx_to_col(COLUMNS['de'])
+            col_explanation = idx_to_col(COLUMNS['explanation'])
+            
+            # Clear old data in main sheet
+            columns_to_clear = [
+                col_price_now, col_today, col_support, col_resist, col_composite_score, col_verdict,
+                col_rsi, col_sharpe, col_squeeze, col_drawdown, col_beta,
+                col_ma_ratio, col_momentum, col_pe, col_de, col_explanation
+            ]
+            ranges_to_clear = [f"{col}2:{col}{total_rows+1}" for col in columns_to_clear]
+            self.sheets_handler.batch_clear(main_sheet, ranges_to_clear)
+            
+            # Reset temp sheet and set header
+            temp_sheet.clear()
+            self.sheets_handler.batch_update(temp_sheet, [
+                {'range': 'A1', 'values': [HEADER]}
+            ])
+            
+            # Check if column L has formula for price diff calculation
             try:
-                return fn(*a, **k)
-            except gspread.exceptions.APIError as e:
-                if e.response.status_code == 429:
-                    wait_time = 2**i
-                    logging.warning(f"Google Sheets API rate limit hit, waiting {wait_time}s")
-                    time.sleep(wait_time)
-                else:
-                    logging.error(f"Google Sheets API error: {e}")
-                    raise
-        logging.error("Google Sheets API 429 retry failed after 3 attempts")
-        raise Exception("Sheets 429 retry failed")
-    return wrapper
-
-@retry_on_429
-def batch_write(ws, updates):
-    if updates:
-        ws.batch_update(updates)
-        time.sleep(1)
-
-# --- Enhanced Stock Analysis Functions ---
-def calculate_comprehensive_score(metrics):
-    """Calculate a more comprehensive stock score using multiple metrics"""
-    try:
-        # Weights for different factors
-        weights = {
-            'technical': 0.6,
-            'fundamental': 0.3,
-            'sentiment': 0.1
-        }
-        
-        # Technical components
-        rsi_score = 0
-        if metrics['rsi'] <= 30:  # Oversold
-            rsi_score = 0.8
-        elif metrics['rsi'] >= 70:  # Overbought
-            rsi_score = 0.2
-        else:  # Neutral zone gets middle score
-            rsi_score = 0.5
-            
-        # Handle sharpe ratio - higher is better
-        sharpe_score = min(max(metrics['sharpe'], 0), 3) / 3
-        
-        # Drawdown - lower is better
-        drawdown_score = 1 - min(metrics['drawdown'] / 100, 1)
-        
-        # MA ratio - above 1 is bullish
-        ma_score = 0.8 if metrics['ma_ratio'] > 1.05 else (0.2 if metrics['ma_ratio'] < 0.95 else 0.5)
-        
-        # Momentum - higher is better
-        mom_score = min(max(metrics['momentum'] / 20 + 0.5, 0), 1)
-        
-        # Technical score
-        technical_score = (
-            rsi_score * 0.2 +
-            sharpe_score * 0.2 +
-            drawdown_score * 0.2 +
-            ma_score * 0.2 +
-            mom_score * 0.2
-        ) * weights['technical']
-        
-        # Fundamental components
-        pe_score = 0
-        if metrics['pe'] > 0:  # Valid P/E
-            # Lower P/E is generally better, but too low might be a red flag
-            # Scoring curve: highest around 10-15, lower for very low or high P/E
-            if metrics['pe'] < 5:
-                pe_score = 0.5  # Potentially undervalued or troubled
-            elif metrics['pe'] < 15:
-                pe_score = 0.9  # Good value zone
-            elif metrics['pe'] < 25:
-                pe_score = 0.7  # Reasonably valued
-            elif metrics['pe'] < 50:
-                pe_score = 0.4  # Getting expensive
-            else:
-                pe_score = 0.2  # Very expensive
-        else:
-            pe_score = 0.3  # No P/E (could be no earnings)
-        
-        # D/E ratio - lower is generally better for stability
-        de_score = 0
-        if metrics['de'] > 0:  # Valid D/E
-            if metrics['de'] < 0.5:
-                de_score = 0.9  # Very low debt
-            elif metrics['de'] < 1:
-                de_score = 0.8  # Low debt
-            elif metrics['de'] < 2:
-                de_score = 0.6  # Moderate debt
-            else:
-                de_score = 0.3  # High debt
-        else:
-            de_score = 0.5  # No D/E data
-            
-        # Fundamental score
-        fundamental_score = (pe_score * 0.6 + de_score * 0.4) * weights['fundamental']
-        
-        # Sentiment components - from AI models
-        openai_score = 1 if 'buy' in metrics['openai'].lower() else (0 if 'sell' in metrics['openai'].lower() else 0.5)
-        gemini_score = 1 if 'buy' in metrics['gemini'].lower() else (0 if 'sell' in metrics['gemini'].lower() else 0.5)
-        sentiment_score = (openai_score * 0.5 + gemini_score * 0.5) * weights['sentiment']
-        
-        # Calculate final score
-        total_score = technical_score + fundamental_score + sentiment_score
-        return round(total_score, 3)
-    except Exception as e:
-        logging.error(f"Score calculation error: {str(e)}")
-        return 0
-
-# --- Main update ---
-def update():
-    try:
-        main, tmp = init_sheets()
-        rows = main.get_all_values()[1:]
-        total = len(rows)
-        logging.info(f"Starting update of {total} symbols at {datetime.now():%H:%M:%S}")
-        print(f"🚀 Starting update of {total} symbols at {datetime.now():%H:%M:%S}")
-
-        # clear old
-        to_clear = [C_PRICE,C_TODAY,C_SUPPORT,C_RESIST,C_SCORE,C_EXP,C_OPENAI,C_GEMINI]
-        main.batch_clear([f"{c}2:{c}{total+1}" for c in to_clear])
-
-        # reset temp
-        tmp.clear()
-        time.sleep(1)
-        batch_write(tmp, [{'range':'A1:P1','values':[HEADER]}])
-
-        temp_buf, main_buf = [], []
-        batch_size = 5
-
-        for idx, row in enumerate(rows, start=2):
-            # Initialize ALL values with defaults to avoid blanks
-            sym = row[0].strip() if len(row) > 0 else "UNKNOWN"
-            date_str = row[2].strip() if len(row) > 2 else ""
-            
-            # Default values for everything
-            price_on_c = 'N/A'
-            support = 0
-            resistance = 0
-            rsi = 50  # default to neutral
-            macd_val = 0
-            signal_val = 0
-            bb_middle, bb_upper, bb_lower = 0, 0, 0
-            sharpe = 0
-            squeeze = 'No'
-            dd = 0  # drawdown
-            beta = 0
-            mar = 1.0  # MA50/200 ratio - default to neutral
-            mom = 0  # momentum
-            pe_val = 0
-            de_val = 0
-            score = 0
-            exp = 'Hold'  # default to Hold rather than N/A
-            ai_o = 'Hold'
-            ai_g = 'Hold'
-
-            print(f"[{idx-1}/{total}] {sym} — fetching price data...", end="\r")
-            logging.info(f"Processing {sym} (row {idx})")
-            
-            # price on date
-            try:
-                dt = datetime.strptime(date_str, '%d/%m/%Y')
-                d1 = yf.Ticker(sym).history(start=dt, end=dt+timedelta(days=1))
-                if not d1.empty:
-                    price_on_c = round(d1['Close'].iloc[0], 2)
+                row2_formulas = main_sheet.get('L2:L2', value_render_option='FORMULA')
+                has_formula = False
+                formula_text = ""
+                
+                if row2_formulas and row2_formulas[0] and row2_formulas[0][0]:
+                    cell_value = row2_formulas[0][0]
+                    if cell_value.startswith('='):
+                        has_formula = True
+                        formula_text = cell_value
+                        logger.info(f"Found existing formula in L2: {formula_text}")
             except Exception as e:
-                logging.error(f"Error fetching date price for {sym}: {str(e)}")
-                price_on_c = 'N/A'  # Use default if error
+                logger.error(f"Error checking for formulas: {str(e)}")
+                has_formula = False
+                
+            # Apply formula to all rows if it exists, or create a default one
+            formula_cells = []
+            for i in range(2, total_rows + 2):
+                formula = formula_text if has_formula else f'=F{i}-K{i}'
+                formula_cells.append({
+                    'range': f'L{i}',
+                    'values': [[formula]]
+                })
+            
+            # Apply formulas to all rows at once
+            if formula_cells:
+                self.sheets_handler.batch_update(main_sheet, formula_cells)
+            
+            # Double-check formula application
+            check_row = main_sheet.get('L2:L2', value_render_option='FORMULA')
+            if check_row and check_row[0] and check_row[0][0].startswith('='):
+                logger.info("Formula successfully applied to column L")
+            else:
+                logger.warning("Formula may not have been applied correctly to column L")
+                
+        except Exception as e:
+            logger.error(f"Error preparing sheets: {str(e)}")
+            raise
+    
+    async def get_sector_data(self, symbols: List[str]) -> Tuple[Dict, Dict]:
+        """Fetch sector data for all symbols for industry benchmarking."""
+        try:
+            sectors, sector_metrics = await asyncio.to_thread(
+                self.data_fetcher.fetch_sector_data, symbols
+            )
+            logger.info(f"Collected sector data for {len(sectors)} symbols across {len(sector_metrics)} sectors")
+            self.cache_sector_data(sectors, sector_metrics)
+            return sectors, sector_metrics
+        except Exception as e:
+            logger.error(f"Error fetching sector data: {str(e)}")
+            return {}, {}
+    
+    async def process_symbols_batch(self, symbol_batch: List[Dict], sectors: Tuple[Dict, Dict]) -> List[Tuple[List, List]]:
+        """Process a batch of symbols in parallel."""
+        sectors_map, sector_metrics = sectors
+        
+        # Create tasks for each symbol in the batch
+        tasks = []
+        for data in symbol_batch:
+            task = self.process_symbol(data, sectors_map, sector_metrics)
+            tasks.append(task)
+        
+        # Run all tasks concurrently and gather results
+        batch_results = await asyncio.gather(*tasks)
+        return batch_results
+    
+    async def process_symbol(self, data: Dict, sectors_map: Dict, sector_metrics: Dict) -> Tuple[List, List]:
+        """Process a single symbol and generate updates for both sheets."""
+        symbol = data.get('symbol')
+        row_idx = data.get('row')
+        date_str = data.get('date')
 
-            # Get historical data with better error handling
-            hist = []
+        if not symbol or not isinstance(symbol, str):
+            logger.error(f"Invalid symbol: {symbol}")
+            return self._generate_empty_updates("INVALID", row_idx or 0)
+
+        if not row_idx or not isinstance(row_idx, int):
+            logger.error(f"Invalid row index for symbol {symbol}: {row_idx}")
+            return self._generate_empty_updates(symbol, 0)
+
+        if date_str:
             try:
-                ticker_data = yf.Ticker(sym).history(period='1y')
-                if not ticker_data.empty:
-                    hist = ticker_data['Close'].tolist()
-            except Exception as e:
-                logging.error(f"Error fetching history for {sym}: {str(e)}")
-                hist = []
+                datetime.strptime(date_str, '%Y-%m-%d')
+            except ValueError:
+                logger.error(f"Invalid date format for symbol {symbol}: {date_str}")
+                date_str = ""
 
-            # Process metrics only if we have sufficient data
-            if len(hist) >= 30:
-                try:
-                    support = round(min(hist[-20:]), 2)
-                    resistance = round(max(hist[-20:]), 2)
-                except Exception as e:
-                    logging.error(f"Support/resistance calculation error for {sym}: {str(e)}")
-                    support, resistance = 0, 0
-                    
-                try:
-                    rsi = round(calculate_rsi(hist), 2)
-                except Exception as e:
-                    logging.error(f"RSI calculation error for {sym}: {str(e)}")
-                    rsi = 50
+        try:
+            logger.info(f"Processing symbol {symbol} for date {date_str}")
+            
+            # Check cache for symbol data
+            all_data = self.get_cached_symbol_data(symbol, date_str)
+            
+            if not all_data:
+                # Fetch all data for this symbol asynchronously if not in cache
+                all_data = await self.data_fetcher.fetch_all_data_for_symbol(symbol, date_str)
+                if all_data:
+                    self.cache_symbol_data(symbol, date_str, all_data)
+            
+            if not all_data:
+                logger.warning(f"No data found for symbol {symbol}")
+                return self._generate_empty_updates(symbol, row_idx)
+            
+            logger.debug(f"Data fetched for {symbol}: {all_data.keys()}")
+            
+            # Store historical data for ML and backtesting
+            if 'price_history' in all_data:
+                self.historical_data[symbol] = all_data['price_history']
+            
+            # Process the fetched data
+            processed_data = self._process_symbol_data(symbol, all_data, sectors_map, sector_metrics)
+            
+            # Generate updates for temp and main sheets
+            temp_updates = self._generate_temp_updates(symbol, row_idx, processed_data)
+            main_updates = self._generate_main_updates(row_idx, processed_data)
+            
+            return temp_updates, main_updates
+            
+        except Exception as e:
+            logger.error(f"Error processing symbol {symbol}: {str(e)}")
+            return self._generate_empty_updates(symbol, row_idx)
+
+    def _process_symbol_data(self, symbol: str, all_data: Dict, sectors_map: Dict, sector_metrics: Dict) -> Dict:
+        """Process the fetched data for a symbol."""
+        processed_data = {}
+        
+        # Extract and process data
+        processed_data['source'] = all_data.get('source', 'N/A')
+        processed_data['date'] = all_data.get('date', 'N/A')
+        processed_data['price_1w'] = all_data.get('price_1w', 'N/A')
+        processed_data['price_1d'] = all_data.get('price_1d', 'N/A')
+        processed_data['price'] = all_data.get('price', 0)
+        processed_data['last_updated'] = all_data.get('last_updated', 'N/A')
+        processed_data['price_on_date'] = all_data.get('price_on_date', 'N/A')
+        
+        # Process support and resistance
+        processed_data['support'] = self._calculate_support(all_data)
+        processed_data['resistance'] = self._calculate_resistance(all_data)
+        
+        # Process other metrics
+        processed_data['rsi'] = self._calculate_rsi(all_data)
+        processed_data['sharpe'] = all_data.get('sharpe', 0) or 0
+        processed_data['squeeze'] = all_data.get('squeeze', False)
+        processed_data['drawdown'] = all_data.get('drawdown', 0) or 0
+        processed_data['beta'] = all_data.get('beta') or 1.0
+        processed_data['ma_ratio'] = all_data.get('ma_ratio') or 1.0
+        processed_data['momentum'] = self._calculate_momentum(all_data)
+        processed_data['pe_ratio'] = all_data.get('pe_ratio') or 15
+        processed_data['de_ratio'] = all_data.get('de_ratio') or 0.8
+        
+        # Get sector information
+        processed_data['sector'] = sectors_map.get(symbol, "Unknown")
+        processed_data['sector_pe'] = sector_metrics.get(processed_data['sector'], {}).get('avg_pe', 15)
+        
+        # Calculate score and verdict
+        processed_data['score'] = self._calculate_score(processed_data)
+        processed_data['verdict'] = self._generate_verdict(processed_data['score'])
+        
+        # Generate explanation
+        processed_data['explanation'] = self._generate_explanation(processed_data)
+        
+        return processed_data
+
+    def _calculate_rsi(self, all_data: Dict) -> float:
+        if 'price_history' in all_data and all_data['price_history'] is not None:
+            prices = all_data['price_history']['Close'].values
+            if len(prices) > 14:
+                return calculate_rsi(prices, 14)  # Using 14 as the default period for RSI
+        return 50  # Neutral RSI as fallback
+
+    def _generate_explanation(self, processed_data: Dict) -> str:
+        """Generate a detailed explanation for the stock's rating."""
+        verdict = processed_data['verdict']
+        score = processed_data['score']
+        
+        explanation = f"The stock's composite score is {score:.2f}, resulting in a {verdict} verdict. "
+        
+        if verdict in ['Strong Buy', 'Buy']:
+            explanation += "This stock is considered a buy because: "
+        elif verdict == 'Hold':
+            explanation += "This stock is not currently recommended as a buy or sell because: "
+        else:
+            explanation += "This stock is not recommended as a buy because: "
+        
+        factors = []
+        if processed_data['rsi'] < 30:
+            factors.append(f"The RSI ({processed_data['rsi']:.2f}) indicates the stock may be oversold")
+        elif processed_data['rsi'] > 70:
+            factors.append(f"The RSI ({processed_data['rsi']:.2f}) indicates the stock may be overbought")
+        
+        if processed_data['sharpe'] > 1:
+            factors.append(f"The Sharpe Ratio ({processed_data['sharpe']:.2f}) suggests good risk-adjusted returns")
+        elif processed_data['sharpe'] < 0:
+            factors.append(f"The Sharpe Ratio ({processed_data['sharpe']:.2f}) suggests poor risk-adjusted returns")
+        
+        if processed_data['drawdown'] > 20:
+            factors.append(f"The Max Drawdown ({processed_data['drawdown']:.2f}%) is relatively high, indicating increased risk")
+        
+        if processed_data['beta'] > 1.5:
+            factors.append(f"The Beta ({processed_data['beta']:.2f}) suggests the stock is more volatile than the market")
+        elif processed_data['beta'] < 0.5:
+            factors.append(f"The Beta ({processed_data['beta']:.2f}) suggests the stock is less volatile than the market")
+        
+        if processed_data['ma_ratio'] > 1:
+            factors.append(f"The MA50/200 Ratio ({processed_data['ma_ratio']:.2f}) indicates a bullish trend")
+        elif processed_data['ma_ratio'] < 1:
+            factors.append(f"The MA50/200 Ratio ({processed_data['ma_ratio']:.2f}) indicates a bearish trend")
+        
+        if processed_data['momentum'] > 5:
+            factors.append(f"The 20d Momentum ({processed_data['momentum']:.2f}%) shows strong positive momentum")
+        elif processed_data['momentum'] < -5:
+            factors.append(f"The 20d Momentum ({processed_data['momentum']:.2f}%) shows strong negative momentum")
+        
+        if processed_data['pe_ratio'] > 25:
+            factors.append(f"The P/E Ratio ({processed_data['pe_ratio']:.2f}) suggests the stock may be overvalued")
+        elif processed_data['pe_ratio'] < 15:
+            factors.append(f"The P/E Ratio ({processed_data['pe_ratio']:.2f}) suggests the stock may be undervalued")
+        
+        if processed_data['de_ratio'] > 2:
+            factors.append(f"The D/E Ratio ({processed_data['de_ratio']:.2f}) indicates high leverage")
+        elif processed_data['de_ratio'] < 0.5:
+            factors.append(f"The D/E Ratio ({processed_data['de_ratio']:.2f}) indicates low leverage")
+        
+        explanation += " ".join(factors)
+        
+        explanation += "\n\nPlease note that this analysis is based on historical data and current market conditions. Always conduct your own research and consider your personal financial situation before making investment decisions."
+        
+        return explanation
+
+    def _calculate_support(self, all_data: Dict) -> float:
+        price = all_data.get('price', 0)
+        if 'price_history' in all_data and all_data['price_history'] is not None:
+            prices = all_data['price_history']['Close'].values
+            if len(prices) > 20:
+                return min(prices[-20:]) * 0.98  # 2% below 20-day min as support estimate
+        return price * 0.95  # 5% below current price as fallback
+
+    def _calculate_resistance(self, all_data: Dict) -> float:
+        price = all_data.get('price', 0)
+        if 'price_history' in all_data and all_data['price_history'] is not None:
+            prices = all_data['price_history']['Close'].values
+            if len(prices) > 20:
+                return max(prices[-20:]) * 1.02  # 2% above 20-day max as resistance estimate
+        return price * 1.05  # 5% above current price as fallback
+
+    def _calculate_momentum(self, all_data: Dict) -> float:
+        if 'price_history' in all_data and all_data['price_history'] is not None:
+            prices = all_data['price_history']['Close'].values
+            if len(prices) > 21:
+                return calculate_momentum(prices, 20)
+        return 0
+
+    def _calculate_score(self, processed_data: Dict) -> float:
+        return self.score_calculator.calculate_advanced_score(processed_data)
+
+    def _generate_verdict(self, score: float) -> str:
+        return self.score_calculator.get_verdict(score)
+
+    def _generate_temp_updates(self, symbol: str, row_idx: int, processed_data: Dict) -> List[Dict]:
+        today = datetime.now().strftime('%Y-%m-%d')
+        squeeze_str = 'Yes' if processed_data['squeeze'] else 'No'
+        
+        return [{
+            'range': f'A{row_idx}:Y{row_idx}',
+            'values': [[
+                symbol,
+                processed_data.get('source', ''),
+                processed_data.get('date', ''),
+                processed_data.get('price_1w', ''),
+                processed_data.get('price_1d', ''),
+                processed_data['price'],
+                processed_data.get('last_updated', ''),
+                round(processed_data['support'], 2),
+                round(processed_data['resistance'], 2),
+                f"{round(processed_data['support'], 2)} - {round(processed_data['resistance'], 2)}",
+                processed_data['price_on_date'],
+                '',  # Price diff (calculated by formula)
+                processed_data['verdict'],
+                today,
+                round(processed_data['rsi'], 2),
+                round(processed_data['sharpe'], 3),
+                squeeze_str,
+                round(processed_data['drawdown'], 2),
+                round(processed_data['beta'], 3),
+                round(processed_data['score'], 3),
+                round(processed_data['ma_ratio'], 3),
+                round(processed_data['momentum'], 3),
+                round(processed_data['pe_ratio'], 2),
+                round(processed_data['de_ratio'], 2),
+                processed_data.get('explanation', '')
+            ]]
+        }]
+
+    def _generate_main_updates(self, row_idx: int, processed_data: Dict) -> List[Dict]:
+        today = datetime.now().strftime('%Y-%m-%d')
+        squeeze_str = 'Yes' if processed_data['squeeze'] else 'No'
+        
+        return [
+            {'range': f'{idx_to_col(COLUMNS["price_now"])}{row_idx}', 'values': [[processed_data['price']]]},
+            {'range': f'{idx_to_col(COLUMNS["last_updated"])}{row_idx}', 'values': [[processed_data.get('last_updated', '')]]},
+            {'range': f'{idx_to_col(COLUMNS["support"])}{row_idx}', 'values': [[round(processed_data['support'], 2)]]},
+            {'range': f'{idx_to_col(COLUMNS["resistance"])}{row_idx}', 'values': [[round(processed_data['resistance'], 2)]]},
+            {'range': f'{idx_to_col(COLUMNS["support_resistance"])}{row_idx}', 'values': [[f"{round(processed_data['support'], 2)} - {round(processed_data['resistance'], 2)}"]]},
+            {'range': f'{idx_to_col(COLUMNS["price_date"])}{row_idx}', 'values': [[processed_data['price_on_date']]]},
+            {'range': f'{idx_to_col(COLUMNS["verdict"])}{row_idx}', 'values': [[processed_data['verdict']]]},
+            {'range': f'{idx_to_col(COLUMNS["today"])}{row_idx}', 'values': [[today]]},
+            {'range': f'{idx_to_col(COLUMNS["rsi"])}{row_idx}', 'values': [[round(processed_data['rsi'], 2)]]},
+            {'range': f'{idx_to_col(COLUMNS["sharpe"])}{row_idx}', 'values': [[round(processed_data['sharpe'], 3)]]},
+            {'range': f'{idx_to_col(COLUMNS["squeeze"])}{row_idx}', 'values': [[squeeze_str]]},
+            {'range': f'{idx_to_col(COLUMNS["drawdown"])}{row_idx}', 'values': [[round(processed_data['drawdown'], 2)]]},
+            {'range': f'{idx_to_col(COLUMNS["beta"])}{row_idx}', 'values': [[round(processed_data['beta'], 3)]]},
+            {'range': f'{idx_to_col(COLUMNS["composite_score"])}{row_idx}', 'values': [[round(processed_data['score'], 3)]]},
+            {'range': f'{idx_to_col(COLUMNS["ma_ratio"])}{row_idx}', 'values': [[round(processed_data['ma_ratio'], 3)]]},
+            {'range': f'{idx_to_col(COLUMNS["momentum"])}{row_idx}', 'values': [[round(processed_data['momentum'], 3)]]},
+            {'range': f'{idx_to_col(COLUMNS["pe"])}{row_idx}', 'values': [[round(processed_data['pe_ratio'], 2)]]},
+            {'range': f'{idx_to_col(COLUMNS["de"])}{row_idx}', 'values': [[round(processed_data['de_ratio'], 2)]]},
+            {'range': f'{idx_to_col(COLUMNS["explanation"])}{row_idx}', 'values': [[processed_data.get('explanation', '')]]}
+        ]
                 
-                try:
-                    macd_val, signal_val = calculate_macd(hist)
-                    macd_val = round(macd_val, 3)
-                    signal_val = round(signal_val, 3)
-                except Exception as e:
-                    logging.error(f"MACD calculation error for {sym}: {str(e)}")
-                    macd_val, signal_val = 0, 0
-                
-                try:
-                    bb_middle, bb_upper, bb_lower = calculate_bollinger_bands(hist)
-                    bb_middle = round(bb_middle, 2)
-                    bb_upper = round(bb_upper, 2)
-                    bb_lower = round(bb_lower, 2)
-                except Exception as e:
-                    logging.error(f"Bollinger bands calculation error for {sym}: {str(e)}")
-                    bb_middle, bb_upper, bb_lower = 0, 0, 0
-                    
-                try:
-                    sharpe = round(calculate_sharpe(pd.Series(hist).pct_change().dropna()), 3)
-                except Exception as e:
-                    logging.error(f"Sharpe calculation error for {sym}: {str(e)}")
-                    sharpe = 0
-                    
-                try:
-                    squeeze = 'Yes' if detect_squeeze(hist) else 'No'
-                except Exception as e:
-                    logging.error(f"Squeeze detection error for {sym}: {str(e)}")
-                    squeeze = 'No'
-                    
-                try:
-                    dd = round(max_drawdown(hist), 2)
-                except Exception as e:
-                    logging.error(f"Drawdown calculation error for {sym}: {str(e)}")
-                    dd = 0
-                    
-                try:
-                    mar = round(calc_moving_avg_ratio(hist), 3)
-                except Exception as e:
-                    logging.error(f"MA ratio calculation error for {sym}: {str(e)}")
-                    mar = 1.0
-                    
-                try:
-                    mom = round(momentum(hist), 3)
-                except Exception as e:
-                    logging.error(f"Momentum calculation error for {sym}: {str(e)}")
-                    mom = 0
+    async def process_symbol(self, data: Dict, sectors_map: Dict, sector_metrics: Dict) -> Tuple[List, List]:
+        """Process a single symbol and generate updates for both sheets."""
+        symbol = data.get('symbol')
+        row_idx = data.get('row')
+        date_str = data.get('date')
 
-                # Get beta - isolate in try/except to prevent failing other calculations
-                try:
-                    prof = fetch_profile(sym)
-                    if isinstance(prof, dict):
-                        try:
-                            beta = round(float(prof.get('beta', 0) or 0), 3)
-                        except:
-                            beta = 0
-                except Exception as e:
-                    logging.error(f"Beta fetch error for {sym}: {str(e)}")
-                    beta = 0
+        if not symbol or not isinstance(symbol, str):
+            logger.error(f"Invalid symbol: {symbol}")
+            return self._generate_empty_updates("INVALID", row_idx or 0)
 
-                # Get P/E - isolate each API call
-                try:
-                    raw_pe = fetch_pe(sym)
-                    pe_val = round(float(raw_pe or 0), 2)
-                except Exception as e:
-                    logging.error(f"P/E fetch error for {sym}: {str(e)}")
-                    pe_val = 0
+        if not row_idx or not isinstance(row_idx, int):
+            logger.error(f"Invalid row index for symbol {symbol}: {row_idx}")
+            return self._generate_empty_updates(symbol, 0)
 
-                # Get D/E - isolate each API call
-                try:
-                    raw_de = fetch_de(sym)
-                    de_val = round(float(raw_de or 0), 2)
-                except Exception as e:
-                    logging.error(f"D/E fetch error for {sym}: {str(e)}")
-                    de_val = 0
+        if date_str:
+            try:
+                datetime.strptime(date_str, '%Y-%m-%d')
+            except ValueError:
+                logger.error(f"Invalid date format for symbol {symbol}: {date_str}")
+                date_str = ""
 
-                # Get AI recommendations - isolate API calls
-                try:
-                    ai_o = fetch_openai(sym)
-                    if not ai_o or ai_o in ['RateLimit', 'Error', 'N/A']:
-                        ai_o = 'Hold'  # Default to Hold on errors
-                except Exception as e:
-                    logging.error(f"OpenAI fetch error for {sym}: {str(e)}")
-                    ai_o = 'Hold'
-                    
-                try:
-                    ai_g = fetch_gemini(sym)
-                    if not ai_g or ai_g in ['RateLimit', 'Error', 'N/A']:
-                        ai_g = 'Hold'  # Default to Hold on errors
-                except Exception as e:
-                    logging.error(f"Gemini fetch error for {sym}: {str(e)}")
-                    ai_g = 'Hold'
+        try:
+            logger.info(f"Processing symbol {symbol} for date {date_str}")
+            
+            # Fetch all data for this symbol asynchronously
+            all_data = await self.data_fetcher.fetch_all_data_for_symbol(symbol, date_str)
+            
+            if not all_data:
+                logger.warning(f"No data found for symbol {symbol}")
+                return self._generate_empty_updates(symbol, row_idx)
+            
+            logger.debug(f"Data fetched for {symbol}: {all_data.keys()}")
+            
+            # Process the fetched data
+            processed_data = self._process_symbol_data(symbol, all_data, sectors_map, sector_metrics)
+            
+            # Generate updates for temp and main sheets
+            temp_updates = self._generate_temp_updates(symbol, row_idx, processed_data)
+            main_updates = self._generate_main_updates(row_idx, processed_data)
+            
+            return temp_updates, main_updates
+            
+        except Exception as e:
+            logger.error(f"Error processing symbol {symbol}: {str(e)}")
+            return self._generate_empty_updates(symbol, row_idx)
+    
+    def _generate_empty_updates(self, symbol: str, row_idx: int) -> Tuple[List, List]:
+        """Generate empty but non-blank updates for a symbol when data fetching fails."""
+        today = datetime.now().strftime('%Y-%m-%d')
+        
+        # Map column names to letters using idx_to_col and COLUMNS
+        col_price_now = idx_to_col(COLUMNS['price_now'])
+        col_today = idx_to_col(COLUMNS['today'])
+        col_support = idx_to_col(COLUMNS['support'])
+        col_resist = idx_to_col(COLUMNS['resistance'])
+        col_support_resistance = idx_to_col(COLUMNS['support_resistance'])
+        col_price_date = idx_to_col(COLUMNS['price_date'])
+        col_composite_score = idx_to_col(COLUMNS['composite_score'])
+        col_rsi = idx_to_col(COLUMNS['rsi'])
+        col_sharpe = idx_to_col(COLUMNS['sharpe'])
+        col_squeeze = idx_to_col(COLUMNS['squeeze'])
+        col_drawdown = idx_to_col(COLUMNS['drawdown'])
+        col_beta = idx_to_col(COLUMNS['beta'])
+        col_ma_ratio = idx_to_col(COLUMNS['ma_ratio'])
+        col_momentum = idx_to_col(COLUMNS['momentum'])
+        col_pe = idx_to_col(COLUMNS['pe'])
+        col_de = idx_to_col(COLUMNS['de'])
+        col_verdict = idx_to_col(COLUMNS['verdict'])
+        col_explanation = idx_to_col(COLUMNS['explanation'])
+        
+        # For temp sheet - provide fallback values for all columns
+        temp_updates = [{
+            'range': f'A{row_idx}:Y{row_idx}',
+            'values': [[
+                symbol,           # Symbol
+                'N/A',            # Source
+                '',               # Date
+                '',               # Price in 1 week
+                '',               # Price in 1 day
+                'N/A',            # Price now
+                '',               # Last updated
+                0,                # Support
+                0,                # Resistance
+                '0 - 0',          # Support & Resistance
+                'N/A',            # Price in date pulled
+                '',               # Price diff
+                'Hold',           # Verdict
+                today,            # Today's date
+                50,               # RSI - neutral
+                0,                # Sharpe
+                'No',             # Squeeze
+                0,                # Drawdown
+                1.0,              # Beta - market average
+                0.5,              # Composite Score - neutral
+                1.0,              # MA ratio - neutral
+                0,                # Momentum
+                15,               # P/E - average
+                0.8,              # D/E - moderate
+                'Insufficient data to generate explanation'  # Explanation
+            ]]
+        }]
+        
+        # For main sheet - provide fallback values for all columns
+        main_updates = [
+            {'range': f'{col_price_now}{row_idx}', 'values': [['N/A']]},
+            {'range': f'{col_today}{row_idx}', 'values': [[today]]},
+            {'range': f'{col_support}{row_idx}', 'values': [[0]]},
+            {'range': f'{col_resist}{row_idx}', 'values': [[0]]},
+            {'range': f'{col_support_resistance}{row_idx}', 'values': [['0 - 0']]},
+            {'range': f'{col_price_date}{row_idx}', 'values': [['N/A']]},
+            {'range': f'{col_composite_score}{row_idx}', 'values': [[0.5]]},
+            {'range': f'{col_rsi}{row_idx}', 'values': [[50]]},
+            {'range': f'{col_sharpe}{row_idx}', 'values': [[0]]},
+            {'range': f'{col_squeeze}{row_idx}', 'values': [['No']]},
+            {'range': f'{col_drawdown}{row_idx}', 'values': [[0]]},
+            {'range': f'{col_beta}{row_idx}', 'values': [[1.0]]},
+            {'range': f'{col_ma_ratio}{row_idx}', 'values': [[1.0]]},
+            {'range': f'{col_momentum}{row_idx}', 'values': [[0]]},
+            {'range': f'{col_pe}{row_idx}', 'values': [[15]]},
+            {'range': f'{col_de}{row_idx}', 'values': [[0.8]]},
+            {'range': f'{col_verdict}{row_idx}', 'values': [['Hold']]},
+            {'range': f'{col_explanation}{row_idx}', 'values': [['Insufficient data to generate explanation']]}
+        ]
+        
+        return temp_updates, main_updates
+    
+    def apply_formatting(self, worksheet, total_rows):
+        """Apply cell formatting to highlight important columns."""
+        try:
+            # Map column names to letters using idx_to_col and COLUMNS
+            col_support = idx_to_col(COLUMNS['support'])
+            col_resist = idx_to_col(COLUMNS['resistance'])
+            col_support_resistance = idx_to_col(COLUMNS['support_resistance'])
+            col_composite_score = idx_to_col(COLUMNS['composite_score'])
+            col_verdict = idx_to_col(COLUMNS['verdict'])
+            col_rsi = idx_to_col(COLUMNS['rsi'])
+            
+            # Highlight Support and Resistance columns
+            self.sheets_handler.format_cells(
+                worksheet,
+                f"{col_support}2:{col_support}{total_rows}",
+                CELL_FORMATS['support_resistance']
+            )
+            self.sheets_handler.format_cells(
+                worksheet,
+                f"{col_resist}2:{col_resist}{total_rows}",
+                CELL_FORMATS['support_resistance']
+            )
+            self.sheets_handler.format_cells(
+                worksheet,
+                f"{col_support_resistance}2:{col_support_resistance}{total_rows}",
+                CELL_FORMATS['support_resistance']
+            )
+            
+            # Highlight Composite Score and Verdict columns
+            self.sheets_handler.format_cells(
+                worksheet,
+                f"{col_composite_score}2:{col_composite_score}{total_rows}",
+                CELL_FORMATS['score_verdict']
+            )
+            self.sheets_handler.format_cells(
+                worksheet,
+                f"{col_verdict}2:{col_verdict}{total_rows}",
+                CELL_FORMATS['score_verdict']
+            )
+            
+            # Highlight RSI column
+            self.sheets_handler.format_cells(
+                worksheet,
+                f"{col_rsi}2:{col_rsi}{total_rows}",
+                CELL_FORMATS['rsi']
+            )
+            
+            logger.info("Applied cell formatting")
+        except Exception as e:
+            logger.error(f"Error applying cell formatting: {str(e)}")
 
-                # Calculate comprehensive score with all metrics
-                metrics = {
-                    'rsi': rsi,
-                    'sharpe': sharpe,
-                    'drawdown': dd,
-                    'ma_ratio': mar,
-                    'momentum': mom,
-                    'pe': pe_val,
-                    'de': de_val,
-                    'openai': ai_o,
-                    'gemini': ai_g
-                }
-                
-                try:
-                    score = calculate_comprehensive_score(metrics)
-                except Exception as e:
-                    logging.error(f"Score calculation error for {sym}: {str(e)}")
-                    score = 0
-                    
-                # Set verdict based on score
-                if score > 0.7:
-                    exp = 'Strong Buy'
-                elif score > 0.5:
-                    exp = 'Buy'
-                elif score > 0.3:
-                    exp = 'Hold'
-                else:
-                    exp = 'Sell'
+    def create_summary_tab(self):
+        """Create and populate the summary tab."""
+        try:
+            summary_sheet = self.sheets_handler.get_or_create_worksheet("Summary")
+            summary_sheet.clear()
 
-            print(f"[{idx-1}/{total}] {sym} | price={price_on_c} sup={support} res={resistance} score={score}      ")
+            total_stocks = len(self.symbol_data_cache)
+            strong_buys = []
+            buys = []
+            holds = []
+            sells = []
+            strong_sells = []
 
-            # Ensure all values are defined before adding to buffers
-            temp_buf.append({
-                'range': f'A{idx}:P{idx}',
-                'values': [[
-                    sym, 
-                    support if support != 0 else 0,  # Force zeros instead of blanks
-                    resistance if resistance != 0 else 0,
-                    rsi if rsi != 0 else 0,
-                    round(sharpe, 3) if sharpe != 0 else 0,
-                    squeeze,
-                    round(dd, 2) if dd != 0 else 0,
-                    round(beta, 3) if beta != 0 else 0,
-                    round(mar, 3) if mar != 0 else 0,
-                    round(mom, 3) if mom != 0 else 0,
-                    round(pe_val, 2) if pe_val != 0 else 0,
-                    round(de_val, 2) if de_val != 0 else 0,
-                    score if score != 0 else 0,
-                    exp, 
-                    ai_o, 
-                    ai_g
-                ]]
-            })
+            for symbol, data in self.symbol_data_cache.items():
+                verdict = data.get('verdict', '')
+                if verdict == 'Strong Buy':
+                    strong_buys.append(symbol)
+                elif verdict == 'Buy':
+                    buys.append(symbol)
+                elif verdict == 'Hold':
+                    holds.append(symbol)
+                elif verdict == 'Sell':
+                    sells.append(symbol)
+                elif verdict == 'Strong Sell':
+                    strong_sells.append(symbol)
 
-            # Ensure main buffer has all values
-            today = datetime.now().strftime('%Y-%m-%d')
-            main_buf += [
-                {'range':f'{C_TODAY}{idx}','values':[[today]]},
-                {'range':f'{C_PRICE}{idx}','values':[[price_on_c]]},
-                {'range':f'{C_SUPPORT}{idx}','values':[[support if support != 0 else 0]]},
-                {'range':f'{C_RESIST}{idx}','values':[[resistance if resistance != 0 else 0]]},
-                {'range':f'{C_SCORE}{idx}','values':[[score if score != 0 else 0]]},
-                {'range':f'{C_EXP}{idx}','values':[[exp]]},
-                {'range':f'{C_OPENAI}{idx}','values':[[ai_o]]},
-                {'range':f'{C_GEMINI}{idx}','values':[[ai_g]]},
-                {'range':f'{C_RSI}{idx}','values':[[rsi if rsi != 0 else 0]]},
-                {'range':f'{C_SHARPE}{idx}','values':[[round(sharpe, 3) if sharpe != 0 else 0]]},
-                {'range':f'{C_SQUEEZE}{idx}','values':[[squeeze]]},
-                {'range':f'{C_DRAWDOWN}{idx}','values':[[round(dd, 2) if dd != 0 else 0]]},
-                {'range':f'{C_BETA}{idx}','values':[[round(beta, 3) if beta != 0 else 0]]},
-                {'range':f'{C_MA_RATIO}{idx}','values':[[round(mar, 3) if mar != 0 else 0]]},
-                {'range':f'{C_MOMENTUM}{idx}','values':[[round(mom, 3) if mom != 0 else 0]]},
-                {'range':f'{C_PE}{idx}','values':[[round(pe_val, 2) if pe_val != 0 else 0]]},
-                {'range':f'{C_DE}{idx}','values':[[round(de_val, 2) if de_val != 0 else 0]]}
+            summary_content = [
+                ["Stock Spike Replicator - Summary"],
+                [""],
+                [f"Total stocks analyzed: {total_stocks}"],
+                [f"Strong Buys: {len(strong_buys)}"],
+                [f"Buys: {len(buys)}"],
+                [f"Holds: {len(holds)}"],
+                [f"Sells: {len(sells)}"],
+                [f"Strong Sells: {len(strong_sells)}"],
+                [""],
+                ["Market Overview:"],
+                [self._generate_market_overview(total_stocks, strong_buys, buys, holds, sells, strong_sells)],
+                [""],
+                ["Top Stock Picks:"],
+                ["Strong Buys:"] + (strong_buys[:5] if strong_buys else ["None"]),
+                ["Buys:"] + (buys[:5] if buys else ["None"]),
+                [""],
+                ["Example Stock Analysis:"],
             ]
 
-            # flush chunks
-            if len(temp_buf) >= batch_size:
-                batch_write(tmp, temp_buf)
-                print(f"Flushed temp up to row {idx}")
-                temp_buf = []
-            if len(main_buf) >= batch_size:
-                batch_write(main, main_buf)
-                print(f"Flushed main up to row {idx}")
-                main_buf = []
+            # Add example stock analysis
+            example_stocks = strong_buys[:2] + buys[:2] + holds[:1]
+            for symbol in example_stocks[:5]:  # Analyze up to 5 stocks
+                analysis = self._generate_stock_analysis(symbol)
+                summary_content.extend(analysis)
 
-        # final flush
-        if temp_buf:
-            batch_write(tmp, temp_buf)
-            print("Final temp flush")
-        if main_buf:
-            batch_write(main, main_buf)
-            print("Final main flush")
+            # Add the rest of the summary content
+            summary_content.extend([
+                [""],
+                ["Variables Used and Their Meanings:"],
+                ["RSI (Relative Strength Index)", "Measures the magnitude of recent price changes to evaluate overbought or oversold conditions."],
+                ["Sharpe Ratio", "Measures the risk-adjusted performance of the stock."],
+                ["Max Drawdown", "The largest peak-to-trough decline in the stock's value."],
+                ["Beta", "Measures the stock's volatility in relation to the overall market."],
+                ["MA50/200 Ratio", "Ratio of 50-day moving average to 200-day moving average, indicates trend direction."],
+                ["20d Momentum", "Measures the rate of change in price over the last 20 days."],
+                ["P/E Ratio", "Price-to-Earnings ratio, a valuation metric."],
+                ["D/E Ratio", "Debt-to-Equity ratio, measures a company's financial leverage."],
+                [""],
+                ["Scoring Weights:"],
+                ["Simple Score Weights:", f"{SIMPLE_SCORE_WEIGHTS}"],
+                ["Advanced Score Weights:", f"{ADVANCED_SCORE_WEIGHTS}"],
+                [""],
+                ["Verdict Thresholds:"],
+                ["Strong Buy", "Composite Score > 0.8 or ML prediction > 5%"],
+                ["Buy", "Composite Score > 0.6 or ML prediction > 2%"],
+                ["Hold", "0.4 <= Composite Score <= 0.6 or -2% <= ML prediction <= 2%"],
+                ["Sell", "Composite Score < 0.4 or ML prediction < -2%"],
+                ["Strong Sell", "Composite Score < 0.2 or ML prediction < -5%"],
+                [""],
+                ["To adjust these values, modify the SIMPLE_SCORE_WEIGHTS and ADVANCED_SCORE_WEIGHTS dictionaries in the config.py file."],
+                ["The verdict thresholds can be adjusted in the ScoreCalculator class in the scoring.py file."],
+                [""],
+                ["Note: This tool provides analysis based on historical data and current market conditions. Always conduct your own research and consider your personal financial situation before making investment decisions."],
+            ])
 
-        logging.info(f"Update loop completed at {datetime.now():%H:%M:%S}")
-        print(f"🔔 Update loop done at {datetime.now():%H:%M:%S}'")
-        return True
+            self.sheets_handler.batch_update(summary_sheet, [{'range': 'A1', 'values': summary_content}])
+            logger.info("Created and populated summary tab")
+        except Exception as e:
+            logger.error(f"Error creating summary tab: {str(e)}")
+
+    def _generate_market_overview(self, total_stocks, strong_buys, buys, holds, sells, strong_sells):
+        """Generate a market overview based on the analyzed stocks."""
+        if not total_stocks:
+            return "No stocks were analyzed. Please check your input data."
+
+        strong_buy_percent = len(strong_buys) / total_stocks * 100
+        buy_percent = len(buys) / total_stocks * 100
+        
+        if strong_buy_percent + buy_percent > 50:
+            return f"The market appears bullish with {strong_buy_percent:.1f}% Strong Buys and {buy_percent:.1f}% Buys. Consider this a potentially good time for strategic investments."
+        elif strong_buy_percent + buy_percent > 30:
+            return f"The market shows mixed signals with {strong_buy_percent:.1f}% Strong Buys and {buy_percent:.1f}% Buys. Some good opportunities may be available, but caution is advised."
+        else:
+            return f"The market appears bearish with only {strong_buy_percent:.1f}% Strong Buys and {buy_percent:.1f}% Buys. It might be wise to be cautious with new investments and focus on capital preservation."
+
+    def _generate_stock_analysis(self, symbol):
+        """Generate a detailed analysis for a given stock."""
+        data = self.symbol_data_cache.get(symbol, {})
+        if not data:
+            return [[f"No data available for {symbol}"]]
+
+        analysis = [
+            [f"Analysis for {symbol}:"],
+            [f"Verdict: {data.get('verdict', 'N/A')}"],
+            [f"Composite Score: {data.get('score', 'N/A')}"],
+            [f"Current Price: ${data.get('price', 'N/A')}"],
+            [f"Support: ${data.get('support', 'N/A')}"],
+            [f"Resistance: ${data.get('resistance', 'N/A')}"],
+            [f"RSI: {data.get('rsi', 'N/A')}"],
+            [f"Sharpe Ratio: {data.get('sharpe', 'N/A')}"],
+            [f"Beta: {data.get('beta', 'N/A')}"],
+            [f"Explanation: {data.get('explanation', 'N/A')}"],
+            [""]
+        ]
+        return analysis
+
+    async def scan_additional_stocks(self):
+        """Scan for additional stocks under $1 on NYSE or NASDAQ."""
+        try:
+            # This is a placeholder. In a real implementation, you would:
+            # 1. Use an API or web scraping to get a list of stocks under $1 on NYSE or NASDAQ
+            # 2. Fetch data for these stocks
+            # 3. Analyze them using the same methods as the main stock list
+            # 4. Add the best performers to the symbol_data_cache
+
+            # For demonstration, we'll add some mock data
+            mock_stocks = ['MOCK1', 'MOCK2', 'MOCK3', 'MOCK4', 'MOCK5']
+            for symbol in mock_stocks:
+                mock_data = await self.data_fetcher.fetch_all_data_for_symbol(symbol)
+                processed_data = self._process_symbol_data(symbol, mock_data)
+                self.symbol_data_cache[symbol] = processed_data
+
+            logger.info(f"Scanned and added {len(mock_stocks)} additional stocks")
+        except Exception as e:
+            logger.error(f"Error scanning additional stocks: {str(e)}")
+
+    def plot_top_pick(self):
+        """
+        Plot the top pick with support and resistance levels.
+        
+        This method creates a visualization of the top-performing stock (based on the highest score)
+        using the plot_top_stock_pick function from the visualizations module. The plot includes
+        historical price data, current price, and support/resistance levels. The resulting image
+        is inserted into the Summary sheet of the Google Sheets document.
+        """
+        try:
+            # Find the top pick (highest score)
+            top_pick = max(self.symbol_data_cache.items(), key=lambda x: x[1].get('score', 0))
+            symbol, data = top_pick
+
+            # Fetch historical price data for the symbol
+            historical_data = self.historical_data.get(symbol)
+            if historical_data is None:
+                logger.error(f"No historical data found for top pick {symbol}")
+                return
+
+            # Create the plot
+            plot_buffer = plot_top_stock_pick(
+                symbol,
+                historical_data,
+                data['price'],
+                data['support'],
+                data['resistance']
+            )
+
+            # Add the plot to the summary sheet
+            summary_sheet = self.sheets_handler.get_worksheet("Summary")
+            self.sheets_handler.insert_image(summary_sheet, 'A100', plot_buffer)
+
+            # Add a text description
+            plot_description = [
+                [f"Top Pick: {symbol}"],
+                [f"Current Price: ${data.get('price', 'N/A')}"],
+                [f"Support: ${data.get('support', 'N/A')}"],
+                [f"Resistance: ${data.get('resistance', 'N/A')}"],
+                [f"Reason: {data.get('explanation', 'N/A')}"],
+            ]
+            self.sheets_handler.batch_update(summary_sheet, [{'range': 'A106', 'values': plot_description}])
+
+            logger.info(f"Added top pick plot and description for {symbol}")
+        except Exception as e:
+            logger.error(f"Error plotting top pick: {str(e)}")
+
+async def main():
+    """Main entry point for the application."""
+    try:
+        app = StockUpdateApp()
+        success = await app.run()
+        
+        if success:
+            app.create_summary_tab()
+            app.plot_top_pick()
+            print("✅ Update completed successfully")
+        else:
+            print("❌ Update failed")
+            
+        return success
     except Exception as e:
-        logging.critical(f"Critical error in update function: {str(e)}")
+        logger.critical(f"Unhandled exception in main: {str(e)}", exc_info=True)
         print(f"❌ Critical error: {str(e)}")
         return False
 
+
 if __name__ == '__main__':
     try:
-        logging.info("Stock update script started")
-        success = update()
-        if success:
-            logging.info("Update completed successfully")
-            print("🎉 Update completed SUCCESSFULLY.")
+        # Run the async main function
+        if sys.version_info >= (3, 7):
+            asyncio.run(main())
         else:
-            logging.error("Update finished but reported failure")
-            print("❌ Update finished but reported failure.")
+            # For Python 3.6
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        print("\n🛑 Update interrupted by user")
+        sys.exit(1)
     except Exception as e:
-        logging.critical(f"Unhandled exception: {str(e)}")
-        print(f"❌ Update FAILED with error: {e}")
+        logger.critical(f"Fatal error: {str(e)}", exc_info=True)
+        print(f"❌ Fatal error: {str(e)}")
+        sys.exit(1)
+    finally:
+        # Clean up any remaining threads
+        import threading
+        for thread in threading.enumerate():
+            if thread is not threading.main_thread():
+                try:
+                    thread.join(timeout=1.0)
+                except Exception as e:
+                    logger.warning(f"Error joining thread {thread.name}: {str(e)}")

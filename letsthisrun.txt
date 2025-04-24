@@ -1,0 +1,3 @@
+okay let this run complete but on future runs on summary tab ensure its clear whether the variables and their values shown are machine-learning generated, user generated, and when was the last updated value for that set,  explain the "machine learning" fitting and folds for candidates etc, and cross-validation score and random_forest to the user and max_depth, etc , so that both technical and less technical users could understand.. Also explain the different sets of variables provided in rows 14 vs 15, and show a detailed example explaining each and how they work
+
+also in the terminal logs explain what is volality, rsi,cci,stoch_k, and why they are being used..
