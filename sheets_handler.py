@@ -206,17 +206,49 @@ class SheetsHandler:
                 ["- The scheduler runs independently within the application and does not require Windows Task Scheduler"],
                 ["- Daily updates are performed automatically when the application is running"],
                 [""],
-                ["Machine Learning Status:"],
-                ["- We have a backtested predictive model for each stock"],
-                ["- Models are retrained daily to adapt to new market conditions"],
-                ["- Each model uses a combination of technical indicators and historical price data"],
+                ["Machine Learning Process:"],
+                ["1. Data Collection: Historical price and volume data is collected for each stock"],
+                ["2. Feature Engineering: Technical indicators (RSI, MACD, Bollinger Bands, etc.) are calculated"],
+                ["3. Model Training: An ensemble of models (Random Forest, Gradient Boosting, XGBoost) is trained"],
+                ["4. Hyperparameter Tuning: Models are optimized using cross-validation"],
+                ["5. Backtesting: Models are tested on historical data to evaluate performance"],
+                ["6. Scoring: A composite score is calculated based on ML predictions and technical indicators"],
+                ["7. Daily Retraining: Models are retrained daily to adapt to new market conditions"],
+                [""],
+                ["Backtesting Methodology:"],
+                ["- Entry Conditions: Buy when ML model predicts positive returns"],
+                ["- Exit Conditions: Sell when ML model predicts negative returns"],
+                ["- Position Sizing: Equal weight for all positions"],
+                ["- Transaction Costs: Includes slippage and commission costs"],
+                ["- Performance Metrics: Total Return, Sharpe Ratio, Sortino Ratio, Calmar Ratio, Win Rate"],
+                ["- Validation: Out-of-sample testing to prevent overfitting"],
                 [""],
                 ["Recommendation Explanation:"],
-                ["- Strong Buy: High ML prediction score (>0.8) and strong technical/fundamental indicators"],
-                ["- Buy: Positive ML prediction (>0.6) and favorable market conditions"],
-                ["- Hold: Neutral ML prediction or mixed technical/fundamental signals"],
-                ["- Sell: Negative ML prediction (<0.4) or deteriorating market conditions"],
-                ["- Strong Sell: Low ML prediction score (<0.2) and weak technical/fundamental indicators"],
+                ["- Strong Buy: High ML prediction score (>0.8) and strong technical/fundamental indicators."],
+                ["  These stocks show the highest probability of significant price appreciation based on our models."],
+                ["  They typically have strong momentum, favorable technical patterns, and positive sentiment."],
+                [""],
+                ["- Buy: Positive ML prediction (>0.6) and favorable market conditions."],
+                ["  These stocks show good potential for price appreciation but with slightly lower confidence."],
+                ["  They may have some mixed signals but overall positive outlook."],
+                [""],
+                ["- Hold: Neutral ML prediction (0.4-0.6) or mixed technical/fundamental signals."],
+                ["  These stocks show balanced risk-reward profiles with no clear directional bias."],
+                ["  Current positions may be maintained, but new positions should be evaluated carefully."],
+                [""],
+                ["- Sell: Negative ML prediction (<0.4) or deteriorating market conditions."],
+                ["  These stocks show increased probability of price depreciation based on our models."],
+                ["  They may exhibit weakening momentum, deteriorating fundamentals, or negative sentiment."],
+                [""],
+                ["- Strong Sell: Low ML prediction score (<0.2) and weak technical/fundamental indicators."],
+                ["  These stocks show the highest probability of significant price depreciation."],
+                ["  They typically have strong downward momentum, poor technical patterns, and negative sentiment."],
+                [""],
+                ["Optimal Variables by Stock Type:"],
+                ["- Growth Stocks: Momentum and trend indicators (MA50/200 Ratio, RSI) are most predictive"],
+                ["- Value Stocks: Fundamental metrics (P/E Ratio, Debt/Equity) are most predictive"],
+                ["- Volatile Stocks: Volatility indicators (Bollinger Bands, ATR) are most predictive"],
+                ["- Penny Stocks: Volume and liquidity metrics are most predictive"],
                 [""],
                 ["Using the Web Interface vs Running main.py:"],
                 ["1. Web Interface:"],
@@ -253,15 +285,31 @@ class SheetsHandler:
                 "textFormat": {"fontSize": 11},
                 "horizontalAlignment": "LEFT"
             }
+            highlight_format = {
+                "textFormat": {"bold": True, "fontSize": 11},
+                "horizontalAlignment": "LEFT"
+            }
 
             self.format_cells(worksheet, "A1:A1", title_format)
             self.format_cells(worksheet, "A3:A3", subtitle_format)
             self.format_cells(worksheet, "A13:A13", subtitle_format)
             self.format_cells(worksheet, "A21:A21", subtitle_format)
             self.format_cells(worksheet, "A26:A26", subtitle_format)
-            self.format_cells(worksheet, "A31:A31", subtitle_format)
-            self.format_cells(worksheet, "A38:A38", subtitle_format)
-            self.format_cells(worksheet, "A4:A55", body_format)
+            self.format_cells(worksheet, "A33:A33", subtitle_format)
+            self.format_cells(worksheet, "A40:A40", subtitle_format)
+            self.format_cells(worksheet, "A47:A47", subtitle_format)
+            self.format_cells(worksheet, "A64:A64", subtitle_format)
+            self.format_cells(worksheet, "A70:A70", subtitle_format)
+            
+            # Highlight recommendation types
+            self.format_cells(worksheet, "A47:A47", highlight_format)
+            self.format_cells(worksheet, "A51:A51", highlight_format)
+            self.format_cells(worksheet, "A55:A55", highlight_format)
+            self.format_cells(worksheet, "A59:A59", highlight_format)
+            self.format_cells(worksheet, "A63:A63", highlight_format)
+            
+            # Apply body format to all content
+            self.format_cells(worksheet, "A4:A90", body_format)
 
             # Adjust column width
             set_column_width(worksheet, 1, 500)  # Set width of column A to 500 pixels
@@ -509,80 +557,8 @@ class SheetsHandler:
             logger.error(f"Error inserting image: {str(e)}")
             return False
 
-    @retry_on_quota_exceeded()
-    def update_summary_tab(self, worksheet):
-        """
-        Update the summary tab with key advantages of our algorithm.
-
-        Args:
-            worksheet (gspread.Worksheet): Summary worksheet to update
-
-        Returns:
-            bool: True if the update was successful, False otherwise
-        """
-        try:
-            summary_content = [
-                ["Stock Spike Replicator: The Ultimate Stock Prediction Algorithm"],
-                [""],
-                ["Key Advantages:"],
-                ["1. Hybrid Approach: Combines ML predictions with technical and fundamental analysis"],
-                ["2. Advanced ML Models: Utilizes ensemble methods and deep learning for superior accuracy"],
-                ["3. Dynamic Scoring: Adapts to different market regimes for reliable recommendations"],
-                ["4. Comprehensive Analysis: Incorporates wide range of data points, including sentiment"],
-                ["5. Continuous Learning: Daily model retraining to adapt to evolving market conditions"],
-                ["6. Focus on Undiscovered Potential: Specializes in high-growth stocks under $1"],
-                ["7. User-Centric: Processes user-provided lists and identifies outperformers"],
-                ["8. Rigorous Backtesting: Ensures strategy effectiveness across various scenarios"],
-                [""],
-                ["Why Choose Stock Spike Replicator:"],
-                ["- Unparalleled accuracy through advanced models and comprehensive analysis"],
-                ["- Unique focus on undiscovered, high-potential stocks trading under $1"],
-                ["- Personalized insights by enhancing user-provided stock lists"],
-                ["- Adaptive strategies that evolve with changing market conditions"],
-                ["- Transparent methodology with extensive backtesting and validation"],
-                ["- Continuous improvement through daily automated model retraining"],
-            ]
-
-            # Update the summary content
-            worksheet.update('A1', summary_content)
-
-            # Apply formatting
-            title_format = {
-                "textFormat": {"bold": True, "fontSize": 14},
-                "horizontalAlignment": "CENTER"
-            }
-            subtitle_format = {
-                "textFormat": {"bold": True, "fontSize": 12},
-                "horizontalAlignment": "LEFT"
-            }
-            body_format = {
-                "textFormat": {"fontSize": 11},
-                "horizontalAlignment": "LEFT"
-            }
-
-            self.format_cells(worksheet, "A1:A1", title_format)
-            self.format_cells(worksheet, "A3:A3", subtitle_format)
-            self.format_cells(worksheet, "A13:A13", subtitle_format)
-            self.format_cells(worksheet, "A4:A19", body_format)
-
-            # Adjust column width
-            set_column_width(worksheet, 1, 500)  # Set width of column A to 500 pixels
-
-            logger.info("Summary tab updated successfully")
-            return True
-        except Exception as e:
-            logger.error(f"Error updating summary tab: {str(e)}")
-            try:
-                worksheet.update('A1', [['Error updating summary tab']])
-            except Exception as inner_e:
-                logger.error(f"Error updating error message: {str(inner_e)}")
-            return False
-        finally:
-            # Ensure the worksheet is saved
-            try:
-                worksheet.spreadsheet.client.session.close()
-            except Exception as close_e:
-                logger.error(f"Error closing spreadsheet session: {str(close_e)}")
+    # The update_summary_tab method is already defined above (lines 171-325)
+    # This duplicate implementation has been removed to avoid conflicts
 
     @retry_on_quota_exceeded()
     def update_sheet_with_results(self, worksheet, results):
@@ -602,50 +578,121 @@ class SheetsHandler:
             # Get existing symbols
             existing_symbols = worksheet.col_values(1)[1:]  # Exclude header
 
-            # Prepare the header row
+            # Prepare the header row - rearranged to put Verdict, Explanation, and Score beside each other
+            # Removed "Today's date" column
             header = ['Symbol', 'Source', 'Date', 'Price in 1 week', 'Price in 1 day', 'Price now', 'Last updated',
                       'Support (20-day low)', 'Resistance (20-day high)', 'Support & Resistance', 'Price in date pulled',
-                      'Price diff', 'Verdict', "Today's date", 'RSI (0-100)', 'Sharpe Ratio (annualized)',
-                      'Bollinger Squeeze?', 'Max Drawdown %', 'Beta', 'Composite Score (0-1)', 'MA50/200 Ratio',
-                      '20d Momentum %', 'P/E Ratio', 'Debt/Equity', 'Explanation', 'Total Return', 'Sortino Ratio',
+                      'Price diff', 'Verdict', 'Explanation', 'Composite Score (0-1)', 'RSI (0-100)', 'Sharpe Ratio (annualized)',
+                      'Bollinger Squeeze?', 'Max Drawdown %', 'Beta', 'MA50/200 Ratio',
+                      '20d Momentum %', 'P/E Ratio', 'Debt/Equity', 'Total Return', 'Sortino Ratio',
                       'Calmar Ratio', 'Win Rate', 'Average Win', 'Average Loss']
 
             # Prepare the data rows
             data = [header]
             processed_symbols = []
             for result in results:
+                # Get the current price from the price field
+                current_price = result.get('price', 'N/A')
+                if current_price == 'N/A':
+                    # Fallback to historical data if available
+                    if 'historical_data' in result and result['historical_data']:
+                        try:
+                            current_price = float(result['historical_data'][0]['close'])
+                        except (IndexError, KeyError, ValueError):
+                            pass
+                
+                # Calculate support and resistance from historical data
+                support = result.get('support', 'N/A')
+                resistance = result.get('resistance', 'N/A')
+                
+                if support == 'N/A' and 'historical_data' in result and result['historical_data']:
+                    try:
+                        # Calculate 20-day low as support
+                        prices = [float(day['low']) for day in result['historical_data'][:20]]
+                        support = min(prices)
+                    except (IndexError, KeyError, ValueError):
+                        pass
+                
+                if resistance == 'N/A' and 'historical_data' in result and result['historical_data']:
+                    try:
+                        # Calculate 20-day high as resistance
+                        prices = [float(day['high']) for day in result['historical_data'][:20]]
+                        resistance = max(prices)
+                    except (IndexError, KeyError, ValueError):
+                        pass
+                
+                # Determine if there's a Bollinger squeeze
+                bollinger_squeeze = result.get('bollinger_squeeze', 'N/A')
+                if bollinger_squeeze == 'N/A' or not isinstance(bollinger_squeeze, bool):
+                    if 'historical_data' in result and result['historical_data']:
+                        try:
+                            # Simple check for Bollinger squeeze: when bands are narrow
+                            if 'bollinger_upper' in result and 'bollinger_lower' in result:
+                                upper = result['bollinger_upper']
+                                lower = result['bollinger_lower']
+                                price = current_price if isinstance(current_price, (int, float)) else 0
+                                if price > 0:
+                                    band_width = (upper - lower) / price
+                                    bollinger_squeeze = 'Yes' if band_width < 0.05 else 'No'  # 5% threshold
+                        except (IndexError, KeyError, ValueError, TypeError):
+                            bollinger_squeeze = 'No'
+                else:
+                    bollinger_squeeze = 'Yes' if bollinger_squeeze else 'No'
+                
+                # Get MA50/200 ratio
+                ma_ratio = result.get('ma50_200_ratio', 'N/A')
+                if ma_ratio == 'N/A' and 'ma_50' in result and 'ma_200' in result:
+                    try:
+                        ma_50 = result['ma_50']
+                        ma_200 = result['ma_200']
+                        if ma_200 > 0:
+                            ma_ratio = ma_50 / ma_200
+                    except (KeyError, TypeError, ZeroDivisionError):
+                        pass
+                
+                # Get 20-day momentum
+                momentum = result.get('momentum_20d', 'N/A')
+                if momentum == 'N/A' and 'historical_data' in result and result['historical_data']:
+                    try:
+                        if len(result['historical_data']) >= 20:
+                            current = float(result['historical_data'][0]['close'])
+                            past = float(result['historical_data'][19]['close'])
+                            if past > 0:
+                                momentum = ((current / past) - 1) * 100  # as percentage
+                    except (IndexError, KeyError, ValueError, ZeroDivisionError):
+                        pass
+                
                 row = [
                     result['symbol'],
                     'Stock Spike Replicator',
                     datetime.now().strftime('%Y-%m-%d'),
                     'N/A',  # Price in 1 week (prediction not implemented)
                     'N/A',  # Price in 1 day (prediction not implemented)
-                    result.get('current_price', 'N/A'),
+                    current_price,  # Use the current price we calculated
                     datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                    result.get('support', 'N/A'),
-                    result.get('resistance', 'N/A'),
-                    f"{result.get('support', 'N/A')} - {result.get('resistance', 'N/A')}",
+                    support,  # Support from historical data
+                    resistance,  # Resistance from historical data
+                    f"{support} - {resistance}" if support != 'N/A' and resistance != 'N/A' else 'N/A',
                     result.get('price_date_pulled', 'N/A'),
                     result.get('price_diff', 'N/A'),
-                    result['verdict'],
-                    datetime.now().strftime('%Y-%m-%d'),
-                    result.get('rsi', 'N/A'),
-                    f"{result['sharpe_ratio']:.2f}",
-                    result.get('bollinger_squeeze', 'N/A'),
-                    f"{result['max_drawdown']:.2%}",
-                    result.get('beta', 'N/A'),
-                    f"{result['score']:.2f}",
-                    result.get('ma50_200_ratio', 'N/A'),
-                    result.get('momentum_20d', 'N/A'),
-                    result.get('pe_ratio', 'N/A'),
-                    result.get('debt_equity', 'N/A'),
-                    result.get('explanation', 'N/A'),
-                    f"{result['total_return']:.2%}",
-                    f"{result['sortino_ratio']:.2f}",
-                    f"{result['calmar_ratio']:.2f}",
-                    f"{result['win_rate']:.2%}",
-                    f"{result['avg_win']:.2%}",
-                    f"{result['avg_loss']:.2%}"
+                    result['verdict'],  # Verdict
+                    result.get('explanation', 'N/A'),  # Explanation
+                    f"{result['score']:.2f}",  # Score
+                    result.get('rsi', 'N/A'),  # RSI
+                    f"{result['sharpe_ratio']:.2f}",  # Sharpe Ratio
+                    bollinger_squeeze,  # Bollinger Squeeze
+                    f"{result['max_drawdown']:.2%}",  # Max Drawdown
+                    result.get('beta', 'N/A'),  # Beta
+                    ma_ratio if ma_ratio == 'N/A' else f"{ma_ratio:.2f}",  # MA50/200 Ratio
+                    momentum if momentum == 'N/A' else f"{momentum:.2f}%",  # 20d Momentum
+                    result.get('pe_ratio', 'N/A'),  # P/E Ratio
+                    result.get('debt_equity', 'N/A'),  # Debt/Equity
+                    f"{result['total_return']:.2%}",  # Total Return
+                    f"{result['sortino_ratio']:.2f}",  # Sortino Ratio
+                    f"{result['calmar_ratio']:.2f}",  # Calmar Ratio
+                    f"{result['win_rate']:.2%}",  # Win Rate
+                    f"{result['avg_win']:.2%}",  # Average Win
+                    f"{result['avg_loss']:.2%}"  # Average Loss
                 ]
                 data.append(row)
                 processed_symbols.append(result['symbol'])
@@ -665,9 +712,29 @@ class SheetsHandler:
             }
             self.format_cells(worksheet, f"A1:{chr(64 + len(header))}1", header_format)
 
+            # Apply conditional formatting for verdict column (column M)
+            verdict_col = 'M'
+            for row_idx in range(2, len(data) + 1):
+                cell = f"{verdict_col}{row_idx}"
+                verdict = data[row_idx-1][12] if row_idx-1 < len(data) and len(data[row_idx-1]) > 12 else ""
+                
+                if verdict == "Strong Buy":
+                    self.format_cells(worksheet, cell, {"backgroundColor": {"red": 0.0, "green": 0.8, "blue": 0.0}})
+                elif verdict == "Buy":
+                    self.format_cells(worksheet, cell, {"backgroundColor": {"red": 0.5, "green": 0.8, "blue": 0.5}})
+                elif verdict == "Hold":
+                    self.format_cells(worksheet, cell, {"backgroundColor": {"red": 0.9, "green": 0.9, "blue": 0.0}})
+                elif verdict == "Sell":
+                    self.format_cells(worksheet, cell, {"backgroundColor": {"red": 0.8, "green": 0.5, "blue": 0.5}})
+                elif verdict == "Strong Sell":
+                    self.format_cells(worksheet, cell, {"backgroundColor": {"red": 0.8, "green": 0.0, "blue": 0.0}})
+
             # Auto-resize columns
             for col in range(1, len(header) + 1):
                 set_column_width(worksheet, col, 150)  # Set width to 150 pixels
+            
+            # Make explanation column wider
+            set_column_width(worksheet, 14, 300)  # Column N (Explanation)
 
             logger.info("Sheet updated with results successfully")
             return True

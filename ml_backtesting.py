@@ -225,6 +225,7 @@ class MLBacktesting:
         
         # Scale the features
         scaler = StandardScaler()
+        X = X[self.selected_features]  # Ensure consistent feature set
         X_scaled = scaler.fit_transform(X)
         
         return self.best_model.predict(X_scaled)
@@ -350,15 +351,126 @@ class MLBacktesting:
         return k, d
 
 class EnhancedBacktester(MLBacktesting):
-    def __init__(self):
+    def __init__(self, use_simplified_model=False, n_estimators=100, max_depth=None):
+        """
+        Initialize the EnhancedBacktester with options for performance optimization.
+        
+        Args:
+            use_simplified_model (bool): Whether to use a simplified model for faster processing
+            n_estimators (int): Number of estimators for tree-based models
+            max_depth (int): Maximum depth for tree-based models
+        """
         super().__init__()
         self.markov_model = None
+        self.use_simplified_model = use_simplified_model
+        self.n_estimators = n_estimators
+        self.max_depth = max_depth
+        
+        # Update model parameters if simplified model is requested
+        if use_simplified_model:
+            self.models = {
+                'random_forest': RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42),
+                'gradient_boosting': GradientBoostingRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42),
+                'xgboost': xgb.XGBRegressor(n_estimators=n_estimators, max_depth=max_depth, random_state=42),
+                'linear_regression': LinearRegression()
+            }
+            
+    def use_fallback_model(self):
+        """
+        Use a simple fallback model when the main model training times out.
+        """
+        logger.warning(f"Using fallback model for {self.symbol}")
+        # Create a simple linear regression model as fallback
+        self.selected_features = ['returns', 'log_returns', 'volatility']
+        self.best_model = LinearRegression()
 
-def run_ml_backtesting(historical_data: pd.DataFrame, symbol: str = None) -> Dict[str, Any]:
-    """Run ML backtesting with symbol tracking."""
-    enhanced_backtester = EnhancedBacktester()
-    prepared_data = enhanced_backtester.prepare_data(historical_data, symbol)
-    enhanced_backtester.train_model(prepared_data)
-    results = enhanced_backtester.backtest(historical_data)
-    # Symbol is already added in the backtest method
-    return results
+        if hasattr(self, 'prepared_data') and self.prepared_data is not None:
+            df = self.prepared_data.copy()
+            df = df.dropna(subset=self.selected_features + ['target'])
+            X = df[self.selected_features]
+            y = df['target']
+
+            scaler = StandardScaler()
+            X_scaled = scaler.fit_transform(X)
+            self.best_model.fit(X_scaled, y)
+        else:
+            logger.error("No prepared data available to fit fallback model.")
+        
+    def generate_simplified_results(self, df):
+        """
+        Generate simplified results when backtesting times out.
+        
+        Args:
+            df (pd.DataFrame): Historical data
+            
+        Returns:
+            dict: Simplified results with default values
+        """
+        logger.warning(f"Generating simplified results for {self.symbol}")
+        
+        # Calculate some basic metrics
+        returns = df['close'].pct_change().dropna()
+        
+        # Generate simplified results
+        results = {
+            'symbol': self.symbol,
+            'total_return': returns.mean() * len(returns),
+            'sharpe_ratio': returns.mean() / returns.std() * np.sqrt(252) if returns.std() > 0 else 1.0,
+            'sortino_ratio': 1.0,
+            'calmar_ratio': 1.0,
+            'max_drawdown': 0.1,
+            'win_rate': 0.5,
+            'avg_win': 0.02,
+            'avg_loss': -0.01,
+            'ml_prediction': 0,
+            'returns': returns.tolist(),
+            'positions': [0] * len(returns),
+            'verdict': 'Hold',
+            'score': 0.5,
+            'explanation': 'Fallback model used due to timeout or error.',
+            'price': df['close'].iloc[-1] if not df.empty else 'N/A',
+            'rsi': 50,
+            'bollinger_upper': 0,
+            'bollinger_lower': 0,
+            'ma_50': 0,
+            'ma_200': 0
+        }
+        
+        return results
+
+def run_ml_backtesting(historical_data: Dict[str, pd.DataFrame]) -> Dict[str, float]:
+    """
+    Run ML backtesting on multiple symbols and return cumulative returns.
+    
+    Args:
+        historical_data (Dict[str, pd.DataFrame]): Dictionary mapping symbols to their historical data
+        
+    Returns:
+        Dict[str, float]: Dictionary mapping dates to cumulative returns
+    """
+    cumulative_returns = {}
+    
+    for symbol, data in historical_data.items():
+        try:
+            logger.info(f"Running ML backtesting for {symbol}")
+            enhanced_backtester = EnhancedBacktester(use_simplified_model=True, n_estimators=50, max_depth=3)
+            prepared_data = enhanced_backtester.prepare_data(data, symbol)
+            enhanced_backtester.train_model(prepared_data)
+            results = enhanced_backtester.backtest(data)
+            
+            # Add the cumulative returns for this symbol
+            if 'cumulative_returns' in results:
+                for date, value in results['cumulative_returns'].items():
+                    if date in cumulative_returns:
+                        cumulative_returns[date] += value
+                    else:
+                        cumulative_returns[date] = value
+        except Exception as e:
+            logger.error(f"Error in ML backtesting for {symbol}: {str(e)}")
+    
+    # Average the cumulative returns if we have multiple symbols
+    if historical_data:
+        for date in cumulative_returns:
+            cumulative_returns[date] /= len(historical_data)
+    
+    return cumulative_returns

@@ -107,29 +107,102 @@ class DataFetcher:
     async def _fetch_from_api(self, symbol: str, api: str) -> Optional[Dict[str, Any]]:
         """Fetch historical data from a specific API."""
         try:
-            url = f"{self.api_endpoints[api]['base_url']}/time_series"
-            params = {
-                "symbol": symbol,
-                "interval": "1day",
-                "outputsize": "5000",
-                "apikey": self.api_keys[api]
-            }
+            # Handle different API formats
+            if api == 'twelvedata':
+                url = f"{self.api_endpoints[api]['base_url']}/time_series"
+                params = {
+                    "symbol": symbol,
+                    "interval": "1day",
+                    "outputsize": "5000",
+                    "apikey": self.api_keys[api]
+                }
+                
+                async with self.rate_limiters[api]:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            
+                            if isinstance(data, dict) and 'values' in data:
+                                await asyncio.sleep(self.request_delay)  # Add delay between requests
+                                return {
+                                    'symbol': symbol,
+                                    'historical_data': data['values']
+                                }
             
-            async with self.rate_limiters[api]:
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url, params=params) as response:
-                        response.raise_for_status()
-                        data = await response.json()
-                        
-                        if isinstance(data, dict) and 'values' in data:
-                            await asyncio.sleep(self.request_delay)  # Add delay between requests
-                            return {
-                                'symbol': symbol,
-                                'historical_data': data['values']
-                            }
-                        else:
-                            logger.error(f"Unexpected data structure for {symbol} from {api}: {data}")
-                            return None
+            elif api == 'financial_modeling_prep':
+                url = f"{self.api_endpoints[api]['base_url']}/historical-price-full/{symbol}"
+                params = {
+                    "apikey": self.api_keys[api]
+                }
+                
+                async with self.rate_limiters[api]:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            
+                            if isinstance(data, dict) and 'historical' in data:
+                                # Convert FMP format to our standard format
+                                historical_data = []
+                                for item in data['historical']:
+                                    historical_data.append({
+                                        'datetime': item['date'],
+                                        'open': item['open'],
+                                        'high': item['high'],
+                                        'low': item['low'],
+                                        'close': item['close'],
+                                        'volume': item['volume']
+                                    })
+                                
+                                await asyncio.sleep(self.request_delay)
+                                return {
+                                    'symbol': symbol,
+                                    'historical_data': historical_data
+                                }
+            
+            elif api == 'alpha_vantage':
+                url = "https://www.alphavantage.co/query"
+                params = {
+                    "function": "TIME_SERIES_DAILY",
+                    "symbol": symbol,
+                    "outputsize": "full",
+                    "apikey": self.api_keys[api]
+                }
+                
+                async with self.rate_limiters[api]:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            
+                            if isinstance(data, dict) and 'Time Series (Daily)' in data:
+                                # Convert Alpha Vantage format to our standard format
+                                time_series = data['Time Series (Daily)']
+                                historical_data = []
+                                
+                                for date, values in time_series.items():
+                                    historical_data.append({
+                                        'datetime': date,
+                                        'open': float(values['1. open']),
+                                        'high': float(values['2. high']),
+                                        'low': float(values['3. low']),
+                                        'close': float(values['4. close']),
+                                        'volume': int(values['5. volume'])
+                                    })
+                                
+                                # Sort by date, newest first
+                                historical_data.sort(key=lambda x: x['datetime'], reverse=True)
+                                
+                                await asyncio.sleep(self.request_delay)
+                                return {
+                                    'symbol': symbol,
+                                    'historical_data': historical_data
+                                }
+            
+            # If we reach here, either the API is not supported or the data format is unexpected
+            logger.error(f"Unsupported API or unexpected data format for {symbol} from {api}")
+            return None
         except aiohttp.ClientResponseError as e:
             if e.status == 429:  # Too Many Requests
                 self._mark_api_rate_limited(symbol, api)
@@ -153,43 +226,81 @@ class DataFetcher:
         Returns:
             Dict[str, Any]: Historical data for the stock.
         """
+        # Check cache first
+        cache_key = f"historical_{symbol}_{datetime.now().strftime('%Y-%m-%d')}"
+        if cache_key in self.price_cache:
+            logger.info(f"Using cached historical data for {symbol}")
+            return self.price_cache[cache_key]
+            
         logger.info(f"Fetching historical data for {symbol}")
         
-        # Try primary API first
-        primary_api = self.api_rotation[0]
-        try:
-            result = await self._fetch_from_api(symbol, primary_api)
-            if result:
-                logger.info(f"Successfully fetched data for {symbol} from primary API {primary_api}")
-                return result
-        except Exception:
-            logger.warning(f"Primary API {primary_api} failed for {symbol}, trying secondary APIs")
+        # Define API priority order based on reliability and rate limits
+        api_priority = ['financial_modeling_prep', 'twelvedata', 'alpha_vantage']
         
-        # Try secondary APIs in sequence, with independent rate limiting
-        for _ in range(len(self.api_rotation) * self.max_retries):
+        # Filter to only available APIs
+        available_apis = [api for api in api_priority if api in self.api_keys]
+        
+        # If no priority APIs are available, fall back to whatever is in api_rotation
+        if not available_apis:
+            available_apis = self.api_rotation
+        
+        # Try each API in priority order
+        for api in available_apis:
+            if symbol in self.symbol_api_state and api in self.symbol_api_state[symbol]['rate_limited_apis']:
+                logger.debug(f"Skipping {api} for {symbol} due to rate limits")
+                continue
+                
+            try:
+                logger.info(f"Trying API {api} for {symbol}")
+                result = await self._fetch_from_api(symbol, api)
+                if result and result.get('historical_data'):
+                    logger.info(f"Successfully fetched data for {symbol} from API {api}")
+                    
+                    # Cache the result
+                    self.price_cache[cache_key] = result
+                    
+                    return result
+            except aiohttp.ClientResponseError as e:
+                if e.status == 429:  # Rate limit hit
+                    self._mark_api_rate_limited(symbol, api)
+                    logger.warning(f"Rate limit hit for {symbol} on {api}. API marked as rate limited.")
+                else:
+                    self._mark_api_failed(symbol, api)
+                    logger.error(f"Error fetching historical data for {symbol} from {api}: {str(e)}")
+            except Exception as e:
+                self._mark_api_failed(symbol, api)
+                logger.error(f"Unexpected error fetching historical data for {symbol} from {api}: {str(e)}")
+        
+        # If all APIs fail, try one more time with any API that's not rate limited
+        for _ in range(len(self.api_rotation)):
             api = self._get_next_api_for_symbol(symbol)
             
             try:
                 if api in self.symbol_api_state[symbol]['rate_limited_apis']:
-                    logger.debug(f"Skipping {api} for {symbol} due to rate limits")
                     continue
                     
-                logger.info(f"Trying API {api} for {symbol}")
+                logger.info(f"Last attempt: Trying API {api} for {symbol}")
                 result = await self._fetch_from_api(symbol, api)
-                if result:
-                    logger.info(f"Successfully fetched data for {symbol} from API {api}")
+                if result and result.get('historical_data'):
+                    logger.info(f"Successfully fetched data for {symbol} from API {api} on last attempt")
+                    
+                    # Cache the result
+                    self.price_cache[cache_key] = result
+                    
                     return result
-            except aiohttp.ClientResponseError as e:
-                if e.status == 429:  # Already marked as rate limited in _fetch_from_api
-                    continue
             except Exception:
                 continue
 
         logger.error(f"Failed to fetch historical data for {symbol} from all APIs")
-        return {
+        empty_result = {
             'symbol': symbol,
             'historical_data': []
         }
+        
+        # Cache the empty result to avoid repeated failures
+        self.price_cache[cache_key] = empty_result
+        
+        return empty_result
 
     @lru_cache(maxsize=1000)
     async def get_all_symbols(self) -> List[str]:
@@ -369,4 +480,205 @@ class DataFetcher:
         
         return total_score / len(headlines)
 
-# Additional methods (fetch_price_history, fetch_fundamentals, etc.) remain unchanged
+    async def fetch_fundamentals(self, symbol: str) -> Dict[str, Any]:
+        """
+        Fetch fundamental data for a given stock symbol.
+        
+        Args:
+            symbol (str): Stock symbol to fetch data for.
+        
+        Returns:
+            Dict[str, Any]: Fundamental data including P/E ratio, debt/equity ratio, etc.
+        """
+        cache_key = f"fundamentals_{symbol}"
+        cached_data = self.price_cache.get(cache_key)
+        
+        if cached_data and (datetime.now() - cached_data['timestamp']).total_seconds() < 86400:  # 24-hour cache
+            logger.info(f"Using cached fundamental data for {symbol}")
+            return cached_data['data']
+            
+        logger.info(f"Fetching fundamental data for {symbol}")
+        
+        # Try Financial Modeling Prep first for fundamentals
+        try:
+            api = 'financial_modeling_prep'
+            if api in self.api_endpoints and api in self.api_keys:
+                url = f"{self.api_endpoints[api]['base_url']}/profile/{symbol}"
+                params = {
+                    "apikey": self.api_keys[api]
+                }
+                
+                async with self.rate_limiters[api]:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            
+                            if data and isinstance(data, list) and len(data) > 0:
+                                profile_data = data[0]
+                                
+                                # Get additional financial ratios
+                                ratios_url = f"{self.api_endpoints[api]['base_url']}/ratios/{symbol}"
+                                async with self.rate_limiters[api]:
+                                    async with session.get(ratios_url, params=params) as ratios_response:
+                                        ratios_response.raise_for_status()
+                                        ratios_data = await ratios_response.json()
+                                        
+                                        # Combine profile and ratios data
+                                        fundamentals = {
+                                            'symbol': symbol,
+                                            'pe_ratio': profile_data.get('pe', None),
+                                            'debt_equity': profile_data.get('debtToEquity', None),
+                                            'market_cap': profile_data.get('mktCap', None),
+                                            'dividend_yield': profile_data.get('lastDiv', None),
+                                            'eps': profile_data.get('eps', None),
+                                            'sector': profile_data.get('sector', None),
+                                            'industry': profile_data.get('industry', None),
+                                            'beta': profile_data.get('beta', None)
+                                        }
+                                        
+                                        # Add additional ratios if available
+                                        if ratios_data and isinstance(ratios_data, list) and len(ratios_data) > 0:
+                                            ratio = ratios_data[0]
+                                            fundamentals.update({
+                                                'price_to_book': ratio.get('priceToBookRatio', None),
+                                                'price_to_sales': ratio.get('priceToSalesRatio', None),
+                                                'roe': ratio.get('returnOnEquity', None),
+                                                'roa': ratio.get('returnOnAssets', None)
+                                            })
+                                        
+                                        # Cache the result
+                                        self.price_cache[cache_key] = {
+                                            'data': fundamentals,
+                                            'timestamp': datetime.now()
+                                        }
+                                        
+                                        logger.info(f"Successfully fetched fundamental data for {symbol} from {api}")
+                                        return fundamentals
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:  # Too Many Requests
+                self._mark_api_rate_limited(symbol, api)
+                logger.warning(f"Rate limit hit for {symbol} on {api} when fetching fundamentals")
+            else:
+                self._mark_api_failed(symbol, api)
+                logger.error(f"Error fetching fundamental data for {symbol} from {api}: {str(e)}")
+        except Exception as e:
+            self._mark_api_failed(symbol, api)
+            logger.error(f"Unexpected error fetching fundamental data for {symbol} from {api}: {str(e)}")
+        
+        # Try Twelve Data as fallback
+        try:
+            api = 'twelvedata'
+            if api in self.api_endpoints and api in self.api_keys:
+                url = f"{self.api_endpoints[api]['base_url']}/fundamentals"
+                params = {
+                    "symbol": symbol,
+                    "apikey": self.api_keys[api]
+                }
+                
+                async with self.rate_limiters[api]:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            
+                            if 'meta' in data and 'fundamentals' in data:
+                                fundamentals_data = data['fundamentals']
+                                
+                                fundamentals = {
+                                    'symbol': symbol,
+                                    'pe_ratio': fundamentals_data.get('pe_ratio', None),
+                                    'debt_equity': fundamentals_data.get('debt_to_equity', None),
+                                    'market_cap': fundamentals_data.get('market_capitalization', None),
+                                    'dividend_yield': fundamentals_data.get('dividend_yield', None),
+                                    'eps': fundamentals_data.get('eps', None),
+                                    'sector': data['meta'].get('sector', None),
+                                    'industry': data['meta'].get('industry', None),
+                                    'beta': fundamentals_data.get('beta', None)
+                                }
+                                
+                                # Cache the result
+                                self.price_cache[cache_key] = {
+                                    'data': fundamentals,
+                                    'timestamp': datetime.now()
+                                }
+                                
+                                logger.info(f"Successfully fetched fundamental data for {symbol} from {api}")
+                                return fundamentals
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:  # Too Many Requests
+                self._mark_api_rate_limited(symbol, api)
+                logger.warning(f"Rate limit hit for {symbol} on {api} when fetching fundamentals")
+            else:
+                self._mark_api_failed(symbol, api)
+                logger.error(f"Error fetching fundamental data for {symbol} from {api}: {str(e)}")
+        except Exception as e:
+            self._mark_api_failed(symbol, api)
+            logger.error(f"Unexpected error fetching fundamental data for {symbol} from {api}: {str(e)}")
+        
+        # Try Alpha Vantage as a last resort
+        try:
+            api = 'alpha_vantage'
+            if api in self.api_keys:
+                # Alpha Vantage doesn't have a direct fundamentals endpoint in our config
+                # but we can use their overview endpoint
+                url = "https://www.alphavantage.co/query"
+                params = {
+                    "function": "OVERVIEW",
+                    "symbol": symbol,
+                    "apikey": self.api_keys[api]
+                }
+                
+                async with self.rate_limiters[api]:
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url, params=params) as response:
+                            response.raise_for_status()
+                            data = await response.json()
+                            
+                            if data and 'Symbol' in data:
+                                fundamentals = {
+                                    'symbol': symbol,
+                                    'pe_ratio': float(data.get('PERatio', 'nan')) if data.get('PERatio', 'nan') != 'None' else None,
+                                    'debt_equity': float(data.get('DebtToEquity', 'nan')) if data.get('DebtToEquity', 'nan') != 'None' else None,
+                                    'market_cap': float(data.get('MarketCapitalization', 'nan')) if data.get('MarketCapitalization', 'nan') != 'None' else None,
+                                    'dividend_yield': float(data.get('DividendYield', 'nan')) if data.get('DividendYield', 'nan') != 'None' else None,
+                                    'eps': float(data.get('EPS', 'nan')) if data.get('EPS', 'nan') != 'None' else None,
+                                    'sector': data.get('Sector', None),
+                                    'industry': data.get('Industry', None),
+                                    'beta': float(data.get('Beta', 'nan')) if data.get('Beta', 'nan') != 'None' else None
+                                }
+                                
+                                # Cache the result
+                                self.price_cache[cache_key] = {
+                                    'data': fundamentals,
+                                    'timestamp': datetime.now()
+                                }
+                                
+                                logger.info(f"Successfully fetched fundamental data for {symbol} from {api}")
+                                return fundamentals
+        except aiohttp.ClientResponseError as e:
+            if e.status == 429:  # Too Many Requests
+                self._mark_api_rate_limited(symbol, api)
+                logger.warning(f"Rate limit hit for {symbol} on {api} when fetching fundamentals")
+            else:
+                self._mark_api_failed(symbol, api)
+                logger.error(f"Error fetching fundamental data for {symbol} from {api}: {str(e)}")
+        except Exception as e:
+            self._mark_api_failed(symbol, api)
+            logger.error(f"Unexpected error fetching fundamental data for {symbol} from {api}: {str(e)}")
+        
+        # Return default values if all APIs fail
+        default_fundamentals = {
+            'symbol': symbol,
+            'pe_ratio': None,
+            'debt_equity': None,
+            'market_cap': None,
+            'dividend_yield': None,
+            'eps': None,
+            'sector': None,
+            'industry': None,
+            'beta': None
+        }
+        
+        logger.warning(f"Failed to fetch fundamental data for {symbol} from all APIs, using default values")
+        return default_fundamentals
